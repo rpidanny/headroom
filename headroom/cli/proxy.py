@@ -1,5 +1,6 @@
 """Proxy server CLI commands."""
 
+import json
 import logging
 import os
 import sys
@@ -20,21 +21,6 @@ from .main import main
 
 # ---------------------------------------------------------------------------
 # Startup log suppression.
-
-def _parse_session_limit_fallback_model_map(raw: str | None) -> dict[str, str] | None:
-    """Parse a JSON model-map string into a dict. Returns None on empty/invalid."""
-    if not raw or not raw.strip():
-        return None
-    try:
-        import json
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict) and all(
-            isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
-        ):
-            return parsed
-    except Exception:
-        pass
-    return None
 #
 # sentence_transformers makes HEAD/GET requests to HuggingFace Hub on every
 # worker startup to validate the model manifest.  Each request produces an
@@ -134,6 +120,21 @@ def _get_env_float(name: str, default: float) -> float:
     """
     value = _get_env_float_optional(name)
     return default if value is None else value
+
+
+def _parse_session_limit_fallback_model_map(raw: str | None) -> dict[str, str] | None:
+    """Parse a JSON model-map string into a dict. Returns None on empty/invalid."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and all(
+            isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+        ):
+            return parsed
+    except Exception:
+        pass
+    return None
 
 
 @main.command()

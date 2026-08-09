@@ -2688,8 +2688,11 @@ class AnthropicHandlerMixin:
             # limit, route through OpenRouter to avoid on-demand surcharges.
             # Only activates when no route-advice backend has already been
             # chosen (extensions always win) and none of the globally-configured
-            # backend is set (e.g. Bedrock). Falls back safely when OpenRouter
-            # credentials are missing or the backend fails to build.
+            # backend is set (e.g. Bedrock). Stays on direct Anthropic when
+            # OPENROUTER_API_KEY is unset or the backend fails to build; once
+            # the OpenRouter backend is actually in use, its runtime failures
+            # (invalid key, network errors, etc.) surface as a 500 below, same
+            # as any other backend.
             _session_router = getattr(self, "session_limit_router", None)
             # Tracks the model actually forwarded upstream (vs. the client's
             # requested `model`) so cost/savings reporting bills the model

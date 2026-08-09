@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -199,6 +200,18 @@ class SessionLimitRouter:
             return None
         if self._backend is not None:
             return self._backend
+
+        # Fail closed (stay on direct Anthropic) when there's no key to
+        # authenticate with, rather than building a backend that will only
+        # discover the missing credential once a real request is dispatched
+        # to OpenRouter — by then the only recourse is a 500 to the client.
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            logger.warning(
+                "SessionLimitRouter: OPENROUTER_API_KEY is not set; "
+                "cannot activate OpenRouter fallback"
+            )
+            self._backend_failed = True
+            return None
 
         try:
             from headroom.backends.litellm import LiteLLMBackend
