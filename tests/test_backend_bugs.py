@@ -200,6 +200,116 @@ class TestLiteLLMToolsForwarding:
             assert isinstance(tool_block["input"], dict)
 
 
+class TestExtendedThinkingForwarding:
+    """Claude Code's `thinking` param must reach litellm.acompletion() unchanged.
+
+    Dropping it silently turns a thinking-budgeted request (temperature=1,
+    max_tokens sized to cover budget_tokens + the answer) into a plain
+    completion request, which can make the model burn its whole max_tokens
+    on invisible reasoning and return almost nothing visible.
+    """
+
+    @staticmethod
+    def _mock_response():
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="Hello", tool_calls=None), finish_reason="stop")
+        ]
+        mock_response.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+        return mock_response
+
+    @pytest.mark.asyncio
+    async def test_thinking_forwarded_in_send_message(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._mock_response()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            body = {
+                "model": "claude-sonnet-4-5-20250929",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 21000,
+                "temperature": 1,
+                "thinking": {"type": "enabled", "budget_tokens": 20000},
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert call_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+
+    @pytest.mark.asyncio
+    async def test_thinking_forwarded_in_stream_message(self):
+        async def _empty_stream():
+            return
+            yield  # pragma: no cover
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = _empty_stream()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            body = {
+                "model": "claude-sonnet-4-5-20250929",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 21000,
+                "temperature": 1,
+                "thinking": {"type": "enabled", "budget_tokens": 20000},
+            }
+
+            events = [e async for e in backend.stream_message(body, {})]
+            assert events  # message_start etc. still emitted
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert call_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+
+    @pytest.mark.asyncio
+    async def test_thinking_omitted_when_absent(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._mock_response()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            body = {
+                "model": "claude-sonnet-4-5-20250929",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert "thinking" not in call_kwargs
+
+    def test_thinking_blocks_preserved_in_history(self):
+        """Assistant thinking blocks must round-trip (signature included).
+
+        Anthropic rejects the next turn without them, and OpenRouter/litellm
+        needs them under `thinking_blocks` to continue extended-thinking
+        conversations correctly.
+        """
+        backend = LiteLLMBackend.__new__(LiteLLMBackend)  # skip __init__ (no litellm calls)
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "reasoning...", "signature": "sig123"},
+                    {"type": "text", "text": "Here is the answer"},
+                ],
+            }
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+        assert converted[0]["thinking_blocks"] == [
+            {"type": "thinking", "thinking": "reasoning...", "signature": "sig123"}
+        ]
+        assert converted[0]["content"] == "Here is the answer"
+
+
 # =============================================================================
 # Message Conversion: tool_use / tool_result (GitHub Issue — Bug 2)
 # =============================================================================
