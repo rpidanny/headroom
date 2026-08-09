@@ -435,6 +435,27 @@ class ProxyConfig:
     # to the pod network. Env: HEADROOM_PROXY_TOKEN.
     proxy_token: str | None = None
 
+    # Session-limit-based OpenRouter fallback. When enabled and the subscription
+    # tracker reports window utilization at or above the threshold, subsequent
+    # Anthropic requests are routed through OpenRouter instead of directly to
+    # Anthropic, avoiding on-demand surcharges after the session limit is reached.
+    # CLI: --session-limit-fallback; env: HEADROOM_SESSION_LIMIT_FALLBACK=1.
+    session_limit_fallback_enabled: bool = False
+    # Utilization threshold (0.0–1.0) at which fallback activates. Default 0.95
+    # means fallback begins when 95% of the 5-hour or 7-day window is used.
+    # CLI: --session-limit-fallback-threshold; env: HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD.
+    session_limit_fallback_threshold: float = 0.95
+    # Optional mapping from Anthropic model IDs to OpenRouter model IDs.
+    # Keys without an entry are handled by ``session_limit_fallback_default_model``
+    # if set, otherwise auto-prefixed with ``anthropic/``.
+    # Env: HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP (JSON object string).
+    session_limit_fallback_model_map: dict[str, str] | None = None
+    # Default OpenRouter model used for any Anthropic model NOT in the above map.
+    # When set, ALL unmatched models route here (e.g. "deepseek/deepseek-chat-v4").
+    # CLI: --session-limit-fallback-default-model;
+    # env: HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL.
+    session_limit_fallback_default_model: str | None = None
+
     # Air-gap master switch — hard-disable ALL outbound network egress
     # (telemetry beacon, update check, license/usage reporter, HuggingFace model
     # downloads) for fully offline / regulated deployments. Env: HEADROOM_OFFLINE=1.

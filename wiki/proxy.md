@@ -396,6 +396,103 @@ Track spending and enforce budgets:
 - Budget periods: hourly, daily, monthly
 - Automatic request rejection when over budget
 
+### Session-Limit Fallback (OpenRouter)
+
+When using Claude Code with a subscription, Anthropic charges **on-demand pricing** after your
+session limit (5-hour or 7-day window) is exhausted. This feature automatically routes requests
+through OpenRouter once your limit approaches, avoiding the surcharge.
+
+**Prerequisites:**
+- An [OpenRouter API key](https://openrouter.ai/keys)
+- Headroom's subscription tracker enabled (default for OAuth accounts)
+
+#### Quick Start
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export HEADROOM_SESSION_LIMIT_FALLBACK=1
+headroom proxy
+```
+
+#### How It Works
+
+1. Headroom polls Anthropic's OAuth usage API every 5 minutes to track your 5-hour and 7-day
+   window utilization.
+2. When either window reaches the configured threshold (default 95%), the proxy switches
+   outgoing requests to OpenRouter.
+3. The Claude model ID is translated to OpenRouter's naming convention and routed through
+   a LiteLLM backend.
+
+Only the **direct Anthropic path** is affected. If you're already using `--backend bedrock`,
+`--backend openrouter`, or route-advice extensions, fallback is a no-op.
+
+#### Model Mapping
+
+By default, unmapped models are prefixed as `anthropic/<model>` (OpenRouter's Anthropic
+convention). You can customize this at three levels:
+
+| Level | Config | Example |
+|-------|--------|---------|
+| **Per-model** | `session_limit_fallback_model_map` | `{"claude-sonnet-4-5-20250929": "deepseek/deepseek-chat-v4"}` |
+| **Blanket default** | `session_limit_fallback_default_model` | `"openai/gpt-4o"` |
+| **Auto-prefix** | *(unset)* | `anthropic/claude-sonnet-4-5-20250929` |
+
+Precedence: per-model mapping → blanket default → auto-prefix.
+
+```bash
+# Route Sonnet to DeepSeek, everything else to GPT-4o
+headroom proxy \
+  --session-limit-fallback \
+  --session-limit-fallback-default-model openai/gpt-4o \
+  --session-limit-fallback-model-map \
+    '{"claude-sonnet-4-5-20250929":"deepseek/deepseek-chat-v4"}'
+```
+
+#### Configuration Reference
+
+##### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session-limit-fallback` | off | Enable automatic OpenRouter fallback when session limit is near |
+| `--session-limit-fallback-threshold` | `0.95` | Utilization threshold (0.0–1.0). Fallback activates when either the 5-hour or 7-day window reaches this percentage |
+| `--session-limit-fallback-default-model` | unset | OpenRouter model for ALL unmatched Anthropic models (e.g. `deepseek/deepseek-chat-v4`, `openai/gpt-4o`) |
+| `--session-limit-fallback-model-map` | unset | JSON object mapping specific Anthropic model IDs to OpenRouter equivalents |
+| `--openrouter-api-key` | unset | OpenRouter API key (also settable via `OPENROUTER_API_KEY` env var) |
+
+##### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEADROOM_SESSION_LIMIT_FALLBACK` | `0` | Set to `1` to enable fallback |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD` | `0.95` | Utilization threshold (0.0–1.0) |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL` | unset | Default OpenRouter model for unmatched Anthropic models |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP` | unset | JSON object: `{"claude-model-id": "openrouter-model-id"}` |
+| `OPENROUTER_API_KEY` | unset | OpenRouter API key |
+
+##### ProxyConfig Fields
+
+When constructing `ProxyConfig` programmatically:
+
+| Field | Type | Default |
+|-------|------|---------|
+| `session_limit_fallback_enabled` | `bool` | `False` |
+| `session_limit_fallback_threshold` | `float` | `0.95` |
+| `session_limit_fallback_default_model` | `str \| None` | `None` |
+| `session_limit_fallback_model_map` | `dict[str, str] \| None` | `None` |
+
+#### Safety Properties
+
+- **No snapshot → no fallback.** If the subscription tracker hasn't polled yet, requests continue
+  through direct Anthropic. No false positives.
+- **Extensions always win.** If a route-advice extension sets a backend, it's never overridden.
+- **Static backends untouched.** If `--backend bedrock` or `--backend openrouter` is already set,
+  fallback is a no-op.
+- **Fail-open.** If the OpenRouter backend fails to build (missing credentials, import error),
+  requests fall back to direct Anthropic rather than blocking traffic.
+- **Logging.** Every fallback activation logs the model mapping at INFO level:
+  `[req-id] Session-limit fallback: routing claude-sonnet-4-5 -> deepseek/deepseek-chat-v4 via OpenRouter`
+
 ### Prometheus Metrics
 
 Export metrics for monitoring:

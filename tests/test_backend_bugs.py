@@ -821,6 +821,48 @@ class TestBedrockApiKeyNotForwarded:
 
         assert "api_key" not in kwargs
 
+    @pytest.mark.asyncio
+    async def test_openrouter_does_not_forward_client_anthropic_key(self):
+        """OpenRouter uses env-based auth (OPENROUTER_API_KEY).
+
+        The session-limit fallback forwards the client's original request
+        headers (its Anthropic ``x-api-key``/``Authorization``) straight
+        through to ``send_message``. Those must never be sent to OpenRouter
+        as ``api_key`` — doing so overrides ``OPENROUTER_API_KEY`` with a
+        credential OpenRouter can't authenticate, causing 401s.
+        """
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(content="Hello", tool_calls=None),
+                finish_reason="stop",
+            )
+        ]
+        mock_response.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = mock_response
+
+            backend = LiteLLMBackend(provider="openrouter")
+            headers = {
+                "x-api-key": "sk-ant-dummy-key",
+                "authorization": "Bearer sk-ant-oat-dummy-token",
+            }
+
+            await backend.send_message(
+                {"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "hi"}]},
+                headers,
+            )
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert "api_key" not in call_kwargs, (
+                f"OpenRouter should not have api_key forwarded from client headers, "
+                f"got: {call_kwargs.get('api_key')}"
+            )
+
 
 # =============================================================================
 # Bedrock Converse Oversized Tool Name Filtering

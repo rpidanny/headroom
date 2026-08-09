@@ -20,6 +20,21 @@ from .main import main
 
 # ---------------------------------------------------------------------------
 # Startup log suppression.
+
+def _parse_session_limit_fallback_model_map(raw: str | None) -> dict[str, str] | None:
+    """Parse a JSON model-map string into a dict. Returns None on empty/invalid."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        import json
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and all(
+            isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+        ):
+            return parsed
+    except Exception:
+        pass
+    return None
 #
 # sentence_transformers makes HEAD/GET requests to HuggingFace Hub on every
 # worker startup to validate the model manifest.  Each request produces an
@@ -110,6 +125,15 @@ def _get_env_float_optional(name: str) -> float | None:
         return float(val)
     except ValueError:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
+
+
+def _get_env_float(name: str, default: float) -> float:
+    """Return the env var as a float, or ``default`` only when it is unset.
+
+    Mirrors ``headroom.proxy.server._get_env_float``.
+    """
+    value = _get_env_float_optional(name)
+    return default if value is None else value
 
 
 @main.command()
@@ -911,6 +935,43 @@ def dashboard(port: int, no_open: bool) -> None:
         "the OpenAI endpoint (env: OPENAI_TARGET_API_HEADERS)"
     ),
 )
+@click.option(
+    "--session-limit-fallback/--no-session-limit-fallback",
+    default=None,
+    help=(
+        "Automatically route to OpenRouter when the Anthropic subscription session "
+        "limit is near (5h or 7d window >= threshold). "
+        "(env: HEADROOM_SESSION_LIMIT_FALLBACK=true)"
+    ),
+)
+@click.option(
+    "--session-limit-fallback-threshold",
+    type=float,
+    default=None,
+    help=(
+        "Utilization threshold (0.0-1.0) at which session-limit fallback activates. "
+        "Default 0.95 = fallback at 95%%. "
+        "(env: HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD)"
+    ),
+)
+@click.option(
+    "--session-limit-fallback-default-model",
+    default=None,
+    help=(
+        "Default OpenRouter model for ALL unmatched Anthropic models "
+        "when session limit is reached. "
+        "(env: HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL)"
+    ),
+)
+@click.option(
+    "--session-limit-fallback-model-map",
+    default=None,
+    help=(
+        "JSON object mapping Anthropic model IDs to OpenRouter equivalents. "
+        "Example: '{\"claude-sonnet-4-5-20250929\":\"deepseek/deepseek-chat-v4\"}'. "
+        "(env: HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP)"
+    ),
+)
 @click.pass_context
 def proxy(
     ctx: click.Context,
@@ -986,6 +1047,10 @@ def proxy(
     anthropic_api_url: str | None,
     anthropic_extra_headers: str | None,
     openai_extra_headers: str | None,
+    session_limit_fallback: bool | None,
+    session_limit_fallback_threshold: float | None,
+    session_limit_fallback_default_model: str | None,
+    session_limit_fallback_model_map: str | None,
     openai_api_url: str | None,
     provider_name: str | None,
     gemini_api_url: str | None,
@@ -1325,6 +1390,27 @@ def proxy(
             if anthropic_pre_upstream_memory_context_timeout_seconds is not None
             else 2.0
         ),
+        session_limit_fallback_enabled=(
+            session_limit_fallback
+            if session_limit_fallback is not None
+            else _get_env_bool("HEADROOM_SESSION_LIMIT_FALLBACK", False)
+        ),
+        session_limit_fallback_threshold=(
+            session_limit_fallback_threshold
+            if session_limit_fallback_threshold is not None
+            else _get_env_float("HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD", 0.95)
+        ),
+        session_limit_fallback_default_model=(
+            session_limit_fallback_default_model
+            or os.environ.get("HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL")
+            or None
+        ),
+        session_limit_fallback_model_map=(
+            _parse_session_limit_fallback_model_map(
+                session_limit_fallback_model_map
+                or os.environ.get("HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP")
+            )
+        ),
     )
 
     memory_status = "DISABLED"
@@ -1455,9 +1541,10 @@ Memory (Multi-Provider):
     # Code-aware status line — same logic the inner banner uses, surfaced here
     # so the click-CLI banner is a complete picture (avoids the dual-banner
     # confusion this branch retired).
-    from headroom.proxy.server import _get_code_aware_banner_status
+    from headroom.proxy.server import _get_code_aware_banner_status, _session_limit_banner_status
 
     code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
+    session_limit_line = f"  Session-Limit:{_session_limit_banner_status(config)}"
 
     # Performance tuning section — only shown when at least one tuning var is active.
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
@@ -1487,6 +1574,7 @@ Starting proxy server...
   Memory:       {memory_status}
   License:      {license_status}
 {code_aware_line}
+{session_limit_line}
 {extensions_line}
 {security_line}
 {stateless_line}{telemetry_line}

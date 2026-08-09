@@ -912,9 +912,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):
@@ -1017,9 +1018,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):
@@ -1270,9 +1272,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):
@@ -1442,9 +1445,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):

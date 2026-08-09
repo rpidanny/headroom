@@ -2682,6 +2682,37 @@ class AnthropicHandlerMixin:
             from headroom.proxy.route_advice import resolver_for
 
             request_backend = resolver_for(self).for_request(request, body=body)
+
+            # Session-limit-based OpenRouter fallback: when the subscription
+            # tracker reports that the 5-hour or 7-day window is near its
+            # limit, route through OpenRouter to avoid on-demand surcharges.
+            # Only activates when no route-advice backend has already been
+            # chosen (extensions always win) and none of the globally-configured
+            # backend is set (e.g. Bedrock). Falls back safely when OpenRouter
+            # credentials are missing or the backend fails to build.
+            _session_router = getattr(self, "session_limit_router", None)
+            # Tracks the model actually forwarded upstream (vs. the client's
+            # requested `model`) so cost/savings reporting bills the model
+            # that was really used when the OpenRouter fallback reroutes.
+            _billed_model = model
+            if (
+                _session_router is not None
+                and request_backend is None
+                and self.anthropic_backend is None
+            ):
+                _session_backend = _session_router.get_backend(model, existing_backend=None)
+                if _session_backend is not None:
+                    request_backend = _session_backend
+                    _openrouter_model = _session_router.map_model(model)
+                    body["model"] = _openrouter_model
+                    _billed_model = _openrouter_model
+                    logger.info(
+                        "[%s] Session-limit fallback: routing %s -> %s via OpenRouter",
+                        request_id,
+                        model,
+                        _openrouter_model,
+                    )
+
             if request_backend is not None:
                 # Route through Bedrock backend
                 try:
@@ -2701,7 +2732,7 @@ class AnthropicHandlerMixin:
                             body,
                             headers,
                             "anthropic",
-                            model,
+                            _billed_model,
                             request_id,
                             original_tokens,
                             optimized_tokens,
@@ -2844,7 +2875,7 @@ class AnthropicHandlerMixin:
                             RequestOutcome(
                                 request_id=request_id,
                                 provider=_backend_name,
-                                model=model,
+                                model=_billed_model,
                                 original_tokens=original_tokens,
                                 optimized_tokens=optimized_tokens,
                                 output_tokens=output_tokens,
