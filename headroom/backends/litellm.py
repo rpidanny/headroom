@@ -927,13 +927,15 @@ class LiteLLMBackend(Backend):
                 kwargs["top_p"] = body["top_p"]
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
-            if "thinking" in body:
+            if "thinking" in body and self.provider != "openrouter":
                 # Extended thinking (litellm.acompletion has a native `thinking`
                 # param). Without this, Claude Code's thinking-enabled requests
                 # (temperature=1, a large max_tokens sized for budget_tokens +
                 # answer) get sent as plain completions: the model may spend the
                 # whole max_tokens budget on invisible reasoning and return only
                 # a token or two of visible content (#1907).
+                # Skip for OpenRouter: it uses OpenAI-compatible endpoints that
+                # don't support the Anthropic-native `thinking` parameter.
                 kwargs["thinking"] = body["thinking"]
 
             # Tools (convert Anthropic format to OpenAI format)
@@ -1047,7 +1049,7 @@ class LiteLLMBackend(Backend):
                 kwargs["top_p"] = body["top_p"]
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
-            if "thinking" in body:
+            if "thinking" in body and self.provider != "openrouter":
                 # See send_message for the full rationale.
                 kwargs["thinking"] = body["thinking"]
             if "tools" in body:

@@ -369,7 +369,15 @@ class SubscriptionTracker(QuotaTracker):
 
     async def _poll_loop(self) -> None:
         assert self._stop_event is not None
-        first_poll = True
+        # Execute first poll immediately to load subscription data before proxy
+        # handles requests. Ensures SessionLimitRouter has latest_snapshot when
+        # early requests arrive. Only polls if a token is available (either from
+        # active request or cached credentials).
+        try:
+            await self._maybe_poll()
+        except Exception as exc:
+            logger.warning("Subscription tracker initial poll error: %s", exc)
+
         while not self._stop_event.is_set():
             try:
                 await self._maybe_poll()
@@ -381,11 +389,9 @@ class SubscriptionTracker(QuotaTracker):
                 # out, leaking one Task per poll interval. Over hours the
                 # accumulated idle waiters bog down the event loop scheduler
                 # (observed as the "aged proxy degradation" in 2026-04-17).
-                timeout = 0 if first_poll else self._poll_interval_s
-                first_poll = False
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=timeout,
+                    timeout=self._poll_interval_s,
                 )
                 break  # stop event was set
             except asyncio.TimeoutError:
