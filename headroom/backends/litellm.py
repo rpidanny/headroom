@@ -934,11 +934,13 @@ class LiteLLMBackend(Backend):
                 # answer) get sent as plain completions: the model may spend the
                 # whole max_tokens budget on invisible reasoning and return only
                 # a token or two of visible content (#1907).
-                # Forwarded for OpenRouter too: litellm filters it per model
-                # (non-reasoning fallback targets silently drop it), and its
-                # OpenRouter config supports `thinking` for reasoning-capable
-                # models such as anthropic/*.
+                # `drop_params` makes litellm silently drop `thinking` instead of
+                # raising UnsupportedParamsError for targets that don't support
+                # it (e.g. non-reasoning OpenRouter fallback models). Reasoning-
+                # capable models (Anthropic native, Bedrock Claude, OpenRouter
+                # anthropic/*) still get it forwarded/translated normally.
                 kwargs["thinking"] = body["thinking"]
+                kwargs["drop_params"] = True
 
             # Tools (convert Anthropic format to OpenAI format)
             if "tools" in body:
@@ -1054,6 +1056,7 @@ class LiteLLMBackend(Backend):
             if "thinking" in body:
                 # See send_message for the full rationale.
                 kwargs["thinking"] = body["thinking"]
+                kwargs["drop_params"] = True
             if "tools" in body:
                 tools_in = body["tools"]
                 # Bedrock Converse API hard-rejects tool names over 64 chars.

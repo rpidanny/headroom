@@ -239,6 +239,10 @@ class TestExtendedThinkingForwarding:
 
             call_kwargs = mock_acomp.call_args[1]
             assert call_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+            # drop_params lets litellm silently drop `thinking` for targets that
+            # don't support it (e.g. non-reasoning OpenRouter fallback models)
+            # instead of raising UnsupportedParamsError (#issue: deepseek 500).
+            assert call_kwargs["drop_params"] is True
 
     @pytest.mark.asyncio
     async def test_thinking_forwarded_in_stream_message(self):
@@ -266,6 +270,7 @@ class TestExtendedThinkingForwarding:
 
             call_kwargs = mock_acomp.call_args[1]
             assert call_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+            assert call_kwargs["drop_params"] is True
 
     @pytest.mark.asyncio
     async def test_thinking_omitted_when_absent(self):
@@ -285,6 +290,49 @@ class TestExtendedThinkingForwarding:
 
             call_kwargs = mock_acomp.call_args[1]
             assert "thinking" not in call_kwargs
+            # drop_params must stay scoped to requests that actually forward
+            # `thinking`, not a blanket flag on every call.
+            assert "drop_params" not in call_kwargs
+
+    def test_thinking_dropped_for_non_reasoning_openrouter_model(self):
+        """Regression test for the deepseek 500 (#issue).
+
+        litellm.get_optional_params() is the pure, no-network validation step
+        acompletion() runs internally before making the API call. Non-reasoning
+        OpenRouter targets don't list `thinking` as a supported param, so
+        without `drop_params=True` this raises UnsupportedParamsError — exactly
+        the reported "openrouter does not support parameters: ['thinking']" 500.
+        """
+        import litellm
+
+        # Without drop_params, the bug reproduces.
+        with pytest.raises(litellm.UnsupportedParamsError):
+            litellm.get_optional_params(
+                model="deepseek/deepseek-v4-flash-latest",
+                custom_llm_provider="openrouter",
+                thinking={"type": "enabled", "budget_tokens": 20000},
+            )
+
+        # With drop_params=True (the fix), it's dropped instead of raised.
+        params = litellm.get_optional_params(
+            model="deepseek/deepseek-v4-flash-latest",
+            custom_llm_provider="openrouter",
+            thinking={"type": "enabled", "budget_tokens": 20000},
+            drop_params=True,
+        )
+        assert "thinking" not in params
+
+    def test_thinking_preserved_for_reasoning_capable_openrouter_model(self):
+        """Reasoning-capable OpenRouter models must still get `thinking`."""
+        import litellm
+
+        params = litellm.get_optional_params(
+            model="anthropic/claude-sonnet-4-5",
+            custom_llm_provider="openrouter",
+            thinking={"type": "enabled", "budget_tokens": 20000},
+            drop_params=True,
+        )
+        assert params["thinking"] == {"type": "enabled", "budget_tokens": 20000}
 
     def test_thinking_blocks_preserved_in_history(self):
         """Assistant thinking blocks must round-trip (signature included).
