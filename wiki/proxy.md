@@ -414,6 +414,8 @@ export HEADROOM_SESSION_LIMIT_FALLBACK=1
 headroom proxy
 ```
 
+> **Dashboard:** All of these knobs (including the OpenRouter API key and model mapping) are also editable from the **OpenRouter Fallback** group in the dashboard Settings GUI at `/dashboard/settings`. The model-mapping field renders as an editable key/value table with autocomplete suggestions for known Claude model IDs. Use **Apply & Restart** to activate changes.
+
 #### How It Works
 
 1. Headroom polls Anthropic's OAuth usage API every 5 minutes to track your 5-hour and 7-day

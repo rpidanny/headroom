@@ -231,7 +231,9 @@ Some settings can be configured via environment variables:
 | `HEADROOM_SESSION_LIMIT_FALLBACK` | Set to `1` to enable automatic OpenRouter fallback when the Anthropic subscription session limit is near. Requires `OPENROUTER_API_KEY`. | `0` |
 | `HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD` | Utilization threshold (0.0–1.0). Fallback activates when either the 5-hour or 7-day window reaches this percentage. | `0.95` |
 | `HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL` | Default OpenRouter model for all unmatched Anthropic models (e.g. `deepseek/deepseek-chat-v4`). | unset |
-| `HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP` | JSON object mapping specific Anthropic model IDs to OpenRouter equivalents. Example: `{"claude-sonnet-4-5-20250929":"deepseek/deepseek-chat-v4"}`. | unset |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP` | JSON object mapping specific Anthropic model IDs to OpenRouter equivalents. Example: `{"claude-sonnet-4-5-20250929":"deepseek/deepseek-chat-v4"}`. Also editable from the dashboard Settings page with a key/value table UI. | unset |
+
+All `HEADROOM_SESSION_LIMIT_FALLBACK*` knobs and `OPENROUTER_API_KEY` are also editable from the **OpenRouter Fallback** group in the dashboard Settings GUI (`/dashboard/settings`). The model-mapping field renders as an editable key/value table with autocomplete for known Claude model IDs.
 
 ## Settings GUI
 

@@ -47,7 +47,7 @@ class SettingField:
     key: str
     label: str
     group: str
-    type: str  # "bool" | "int" | "float" | "str" | "enum" | "optional-bool" | "csv-list"
+    type: str  # "bool" | "int" | "float" | "str" | "enum" | "optional-bool" | "csv-list" | "header-map" | "model-map"
     default: Any = None
     choices: tuple[str, ...] = ()
     help: str = ""
@@ -489,6 +489,60 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Cloud region for Bedrock/Vertex/etc backends.",
         tier="advanced",
     ),
+    # --- OpenRouter Fallback (session-limit rerouting) ---
+    SettingField(
+        "HEADROOM_SESSION_LIMIT_FALLBACK",
+        "session_limit_fallback",
+        "OpenRouter fallback",
+        "OpenRouter Fallback",
+        "bool",
+        default=False,
+        help="Route to OpenRouter when Anthropic subscription usage hits the threshold (requires OpenRouter API key).",
+        tier="basic",
+    ),
+    SettingField(
+        "OPENROUTER_API_KEY",
+        "openrouter_api_key",
+        "OpenRouter API key",
+        "OpenRouter Fallback",
+        "str",
+        default=None,
+        secret=True,
+        help="API key for OpenRouter. Required for session-limit fallback to activate.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL",
+        "session_limit_fallback_default_model",
+        "Default fallback model",
+        "OpenRouter Fallback",
+        "str",
+        default=None,
+        help="OpenRouter model used for any Anthropic model NOT in the model mapping (e.g. 'openai/gpt-4o', 'deepseek/deepseek-chat-v4'). When unset, unmatched models auto-prefix anthropic/<model>.",
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP",
+        "session_limit_fallback_model_map",
+        "Model mapping",
+        "OpenRouter Fallback",
+        "model-map",
+        default=None,
+        help="Maps Anthropic model IDs to OpenRouter equivalents. Unmapped models use the default fallback model, or auto-prefix anthropic/<model>.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD",
+        "session_limit_fallback_threshold",
+        "Fallback threshold",
+        "OpenRouter Fallback",
+        "float",
+        default=0.95,
+        minimum=0.0,
+        maximum=1.0,
+        help="Utilization (0.0-1.0) at which fallback activates. 0.95 = 95% of the 5h or 7d window.",
+        tier="advanced",
+    ),
     # --- Timeouts ---
     SettingField(
         "HEADROOM_RETRY_MAX_ATTEMPTS",
@@ -761,7 +815,7 @@ def _coerce(field: SettingField, value: Any) -> Any:
         tokens = [str(token).strip() for token in tokens]
         tokens = [token for token in tokens if token]
         return ",".join(tokens) if tokens else None
-    if field.type == "header-map":
+    if field.type in ("header-map", "model-map"):
         if isinstance(value, dict):
             parsed = value
         else:

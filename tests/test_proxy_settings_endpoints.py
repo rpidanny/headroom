@@ -284,3 +284,94 @@ class TestSettingsPageRoute:
         resp = client.get("/dashboard/settings")
         assert resp.status_code == 200, resp.text
         assert "<" in resp.text  # rendered HTML page
+
+
+class TestOpenRouterFallbackSchema:
+    def test_schema_includes_openrouter_fallback_group(self, client):
+        resp = client.get("/settings/schema")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "OpenRouter Fallback" in body["groups"]
+        by_key = {f["key"]: f for f in body["fields"]}
+        for key in (
+            "session_limit_fallback",
+            "openrouter_api_key",
+            "session_limit_fallback_default_model",
+            "session_limit_fallback_model_map",
+            "session_limit_fallback_threshold",
+        ):
+            assert key in by_key, f"missing field {key}"
+        assert by_key["session_limit_fallback"]["type"] == "bool"
+        assert by_key["openrouter_api_key"]["secret"] is True
+        assert by_key["session_limit_fallback_model_map"]["type"] == "model-map"
+        assert by_key["session_limit_fallback_threshold"]["type"] == "float"
+
+    def test_schema_includes_anthropic_models(self, client):
+        resp = client.get("/settings/schema")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "anthropic_models" in body
+        assert isinstance(body["anthropic_models"], list)
+        assert len(body["anthropic_models"]) > 0
+        assert "claude-sonnet-4-5" in body["anthropic_models"]
+
+
+class TestOpenRouterFallbackWrite:
+    def test_valid_write_persists(self, client, workspace):
+        resp = client.post(
+            "/settings",
+            json={
+                "values": {
+                    "session_limit_fallback": True,
+                    "openrouter_api_key": "sk-or-test",
+                    "session_limit_fallback_default_model": "openai/gpt-4o",
+                    "session_limit_fallback_model_map": '{"claude-x": "openai/gpt-4o"}',
+                    "session_limit_fallback_threshold": 0.9,
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True
+        assert set(body["changed_keys"]) == {
+            "session_limit_fallback",
+            "openrouter_api_key",
+            "session_limit_fallback_default_model",
+            "session_limit_fallback_model_map",
+            "session_limit_fallback_threshold",
+        }
+        stored = settings_store.load()
+        assert stored["session_limit_fallback"] is True
+        assert stored["openrouter_api_key"] == "sk-or-test"
+        assert stored["session_limit_fallback_default_model"] == "openai/gpt-4o"
+        assert stored["session_limit_fallback_model_map"] == '{"claude-x": "openai/gpt-4o"}'
+        assert stored["session_limit_fallback_threshold"] == 0.9
+
+    def test_get_settings_masks_api_key(self, client, workspace):
+        settings_store.save({"openrouter_api_key": "sk-or-secret"})
+        resp = client.get("/settings")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["openrouter_api_key"] == settings_store._MASK
+
+    def test_schema_values_mask_api_key(self, client, workspace):
+        settings_store.save({"openrouter_api_key": "sk-or-secret"})
+        resp = client.get("/settings/schema")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["values"]["openrouter_api_key"] == settings_store._MASK
+
+    def test_threshold_out_of_range_422(self, client, workspace):
+        resp = client.post(
+            "/settings",
+            json={"values": {"session_limit_fallback_threshold": 2.0}},
+        )
+        assert resp.status_code == 422, resp.text
+        assert "session_limit_fallback_threshold" in resp.json()["field_errors"]
+
+    def test_model_map_invalid_json_422(self, client, workspace):
+        resp = client.post(
+            "/settings",
+            json={"values": {"session_limit_fallback_model_map": "not json"}},
+        )
+        assert resp.status_code == 422, resp.text
+        assert "session_limit_fallback_model_map" in resp.json()["field_errors"]

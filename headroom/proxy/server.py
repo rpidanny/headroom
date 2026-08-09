@@ -3482,6 +3482,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def settings_schema(_request: Request):
         """Registry + grouped fields + effective values for the settings form."""
         schema = settings_store.to_schema()
+        # Known Anthropic model IDs for the model-map autocomplete in the UI.
+        # Read-only suggestion list; the input stays free-text for custom IDs.
+        try:
+            from headroom.providers.anthropic import ANTHROPIC_CONTEXT_LIMITS
+
+            schema["anthropic_models"] = sorted(ANTHROPIC_CONTEXT_LIMITS.keys())
+        except Exception:  # noqa: BLE001 — schema must render even if import fails
+            schema["anthropic_models"] = []
         # Tell the UI whether this is a supervised (docker/service) install, where
         # manifest-baked knobs (HEADROOM_PORT/HEADROOM_HOST) are owned by the
         # install manifest and must be rendered read-only. Foreground proxies
