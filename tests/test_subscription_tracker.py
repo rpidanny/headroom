@@ -157,21 +157,24 @@ async def test_maybe_poll_handles_inactive_and_none_snapshot(
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
 
-    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
-    await tracker._maybe_poll()
-    assert tracker._state.poll_count == 0
-
-    monkeypatch.setattr(
-        "headroom.subscription.client.read_cached_oauth_token", lambda: "cached-token"
-    )
-
     async def fetch_none(token: str | None):
         return None
 
     tracker._client = SimpleNamespace(fetch=fetch_none)
+
+    # Poll with no token available (fetch(None) returns None, marked as error)
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
     await tracker._maybe_poll()
     assert tracker._state.last_error == "fetch returned None"
     assert tracker._state.poll_errors == 1
+
+    # Poll with cached token available but fetch still returns None
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "cached-token"
+    )
+    await tracker._maybe_poll()
+    assert tracker._state.last_error == "fetch returned None"
+    assert tracker._state.poll_errors == 2
 
 
 @pytest.mark.asyncio

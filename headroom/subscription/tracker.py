@@ -407,8 +407,6 @@ class SubscriptionTracker(QuotaTracker):
             from headroom.subscription.client import read_cached_oauth_token
 
             bg_token = read_cached_oauth_token()
-            if not bg_token:
-                return
             token = token or bg_token
 
         snapshot = await self._client.fetch(token)
