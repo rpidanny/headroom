@@ -315,6 +315,19 @@ class TestOpenRouterFallbackSchema:
         assert len(body["anthropic_models"]) > 0
         assert "claude-sonnet-4-5" in body["anthropic_models"]
 
+    def test_schema_includes_anthropic_model_families(self, client):
+        resp = client.get("/settings/schema")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "anthropic_model_families" in body
+        assert isinstance(body["anthropic_model_families"], list)
+        assert len(body["anthropic_model_families"]) > 0
+        # Family slugs derived from the known model IDs.
+        for fam in ("sonnet-5", "opus-4-8", "fable-5", "haiku-4-5"):
+            assert fam in body["anthropic_model_families"], f"missing family {fam}"
+        # Full IDs must not leak into the family list.
+        assert "claude-sonnet-4-5-20250929" not in body["anthropic_model_families"]
+
 
 class TestOpenRouterFallbackWrite:
     def test_valid_write_persists(self, client, workspace):

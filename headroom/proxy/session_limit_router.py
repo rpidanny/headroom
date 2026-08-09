@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,83 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_THRESHOLD = 0.95
 _DEFAULT_MODEL_MAP: dict[str, str] = {}
+
+# Suffixes stripped to reduce a full Anthropic model ID to its family slug.
+# Order matters: the [1m] context marker and dated/Bedrock suffixes are all
+# trailing, so stripping them leaves the "<tier>-<version>" family.
+_FAMILY_SUFFIX_RE = re.compile(
+    r"""
+    \[1m\]$          # context-window marker (claude-sonnet-5[1m])
+    | -\d{8}$        # release date (claude-sonnet-4-5-20250929)
+    | -latest$       # convenience alias
+    | -v\d+(?::\d+)$ # Bedrock version suffix (-v1:0)
+    """,
+    re.VERBOSE,
+)
+
+# Current-generation tiers for recognizing bare family-slug map keys
+# (``sonnet-5``). The ``claude-`` form needs no tier list, but a bare slug
+# has nothing to disambiguate it from an arbitrary custom key, so it must
+# match a known tier to be treated as a family mapping.
+_FAMILY_TIER_RE = re.compile(r"^(fable|opus|sonnet|haiku)-")
+
+
+def _normalize_key(key: str) -> str:
+    """Case-fold + trim a model-map key for tolerant matching.
+
+    The stored JSON keeps the operator's original casing for display; only the
+    lookup is normalized so ``Sonnet-5``, `` sonnet-5 `` and ``SONNET-5`` all
+    resolve to the same entry.
+    """
+    return key.strip().casefold()
+
+
+def _family_lookup_key(key: str) -> str | None:
+    """The family lookup key if ``key`` is a family-style mapping key, else None.
+
+    Two shapes are family keys (any version in the family routes there):
+      * bare slugs: ``sonnet-5``, ``opus-4-8``, ``fable-5``
+      * undated ``claude-`` pins: ``claude-sonnet-5``, ``claude-opus-4-8``
+        (no date/``[1m]``/Bedrock suffix) — e.g. the operator's existing
+        ``claude-sonnet-5`` entry keeps working as a family, not just an
+        exact, mapping.
+
+    Dated full IDs (``claude-sonnet-4-5-20250929``) and arbitrary keys are
+    NOT family keys — they stay exact-only (a dated ID is an explicit pin).
+    """
+    n = _normalize_key(key)
+    if n.startswith("claude-"):
+        remainder = n[len("claude-") :]
+        family = _anthropic_model_family(n)
+        if family is not None and family == remainder:
+            return _normalize_key(family)
+        return None
+    if _FAMILY_TIER_RE.match(n):
+        return n
+    return None
+
+
+def _anthropic_model_family(anthropic_model: str) -> str | None:
+    """Reduce an Anthropic model ID to its family slug.
+
+    Strips (rather than pattern-matching a tier list) so future models
+    (``claude-sonnet-6``, ``claude-opus-5-2``) resolve without code changes:
+
+      ``claude-sonnet-5`` / ``claude-sonnet-5[1m]``     -> ``sonnet-5``
+      ``claude-sonnet-4-6`` / ``claude-sonnet-4-5-20250929`` -> ``sonnet-4-6`` / ``sonnet-4-5``
+      ``claude-opus-4-8`` / ``claude-opus-4-5-20251101`` -> ``opus-4-8`` / ``opus-4-5``
+      ``claude-fable-5``                                 -> ``fable-5``
+      ``claude-haiku-4-5-20251001``                     -> ``haiku-4-5``
+
+    Legacy Claude 3 IDs (``claude-3-5-sonnet-…``) normalize to ``3-5-sonnet``;
+    they're EOL and won't appear in an OpenRouter map, so the oddity is harmless.
+    """
+    s = anthropic_model
+    if not s.startswith("claude-"):
+        return None
+    s = s[len("claude-") :]
+    s = _FAMILY_SUFFIX_RE.sub("", s)
+    return s or None
 
 
 class SessionLimitRouter:
@@ -73,6 +151,19 @@ class SessionLimitRouter:
         self._model_map: dict[str, str] = dict(
             getattr(config, "session_limit_fallback_model_map", None) or _DEFAULT_MODEL_MAP
         )
+        # Case/space-tolerant lookup index; preserves the operator's original
+        # casing only as the stored value source — lookups normalize both sides.
+        self._model_map_normalized: dict[str, str] = {
+            _normalize_key(k): v for k, v in self._model_map.items()
+        }
+        # Family-resolution index: family lookup key -> value. Any family-style
+        # key (bare slug ``sonnet-5`` or undated ``claude-sonnet-5``) registers
+        # here so incoming dated/aliased models route to the family target.
+        self._family_map: dict[str, str] = {}
+        for k, v in self._model_map.items():
+            fk = _family_lookup_key(k)
+            if fk is not None and fk not in self._family_map:
+                self._family_map[fk] = v
         self._default_model: str | None = getattr(
             config, "session_limit_fallback_default_model", None
         ) or None
@@ -159,9 +250,18 @@ class SessionLimitRouter:
         """Translate an Anthropic model ID to the OpenRouter format.
 
         Precedence:
-        1. Explicit mapping from ``session_limit_fallback_model_map``
-        2. ``session_limit_fallback_default_model`` (routes ALL unmatched models)
-        3. ``anthropic/<model>`` prefix (OpenRouter's Anthropic convention)
+        1. Exact match on the full incoming model ID in
+           ``session_limit_fallback_model_map`` (escape hatch for pinning one
+           specific version).
+        2. Family match: the model's family slug (e.g. ``sonnet-5`` derived
+           from ``claude-sonnet-5[1m]``) looked up in the map. Any version in
+           that family resolves to one OpenRouter target.
+        3. ``session_limit_fallback_default_model`` (routes ALL unmatched
+           models).
+        4. ``anthropic/<model>`` prefix (OpenRouter's Anthropic convention).
+
+        Keys are matched case- and whitespace-insensitively, so ``Sonnet-5``
+        and `` sonnet-5 `` match.
 
         Args:
             anthropic_model: The Anthropic-native model ID (e.g.
@@ -172,10 +272,22 @@ class SessionLimitRouter:
             ``deepseek/deepseek-chat-v4`` or
             ``anthropic/claude-sonnet-4-5-20250929``).
         """
-        if anthropic_model in self._model_map:
-            return self._model_map[anthropic_model]
+        norm = _normalize_key(anthropic_model)
+        # 1. Exact full-ID match (a dated ID, e.g. claude-sonnet-4-5-20250929,
+        # pins that one version).
+        if norm and norm in self._model_map_normalized:
+            return self._model_map_normalized[norm]
+        # 2. Family match: the incoming model's family resolves against any
+        # family-style key in the map (bare slug or undated claude- pin).
+        family = _anthropic_model_family(anthropic_model)
+        if family is not None:
+            family_norm = _normalize_key(family)
+            if family_norm in self._family_map:
+                return self._family_map[family_norm]
+        # 3. Catch-all default model.
         if self._default_model:
             return self._default_model
+        # 4. Auto-prefix.
         return f"anthropic/{anthropic_model}"
 
     async def start(self) -> None:

@@ -445,7 +445,10 @@ class ProxyConfig:
     # means fallback begins when 95% of the 5-hour or 7-day window is used.
     # CLI: --session-limit-fallback-threshold; env: HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD.
     session_limit_fallback_threshold: float = 0.95
-    # Optional mapping from Anthropic model IDs to OpenRouter model IDs.
+    # Optional mapping from Anthropic models to OpenRouter model IDs.
+    # Keys may be model families (e.g. "sonnet-5", "opus-4-8", "fable-5") —
+    # any version in that family matches — or full Anthropic IDs as an exact
+    # override. Matching is case- and whitespace-insensitive.
     # Keys without an entry are handled by ``session_limit_fallback_default_model``
     # if set, otherwise auto-prefixed with ``anthropic/``.
     # Env: HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP (JSON object string).

@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -3488,8 +3489,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             from headroom.providers.anthropic import ANTHROPIC_CONTEXT_LIMITS
 
             schema["anthropic_models"] = sorted(ANTHROPIC_CONTEXT_LIMITS.keys())
+            # Family slugs (sonnet-5, opus-4-8, fable-5, …) derived from the
+            # known IDs, presented first in the UI as the preferred mapping key:
+            # one family entry maps every version in that family.
+            from headroom.proxy.session_limit_router import (
+                _anthropic_model_family,
+                _family_lookup_key,
+            )
+
+            families = {
+                f
+                for f in (
+                    _anthropic_model_family(m) for m in ANTHROPIC_CONTEXT_LIMITS
+                )
+                if f
+            }
+            # Current-gen family keys the router honors (bare slugs such as
+            # sonnet-5 and undated claude- pins such as claude-sonnet-5).
+            # Drop EOL families (claude-2.x, claude-3-*: "3-5-sonnet", "2.1",
+            # "instant-1.2") from the UI suggestion list — the router matches
+            # them fine, but the chips should emphasize what operators
+            # actually map today.
+            suggested_keys = {f for f in families if _family_lookup_key(f) is not None}
+            current_gen = {
+                f for f in suggested_keys if re.match(r"^(fable|opus|sonnet|haiku)-\d", f)
+            }
+            schema["anthropic_model_families"] = sorted(current_gen)
         except Exception:  # noqa: BLE001 — schema must render even if import fails
             schema["anthropic_models"] = []
+            schema["anthropic_model_families"] = []
         # Tell the UI whether this is a supervised (docker/service) install, where
         # manifest-baked knobs (HEADROOM_PORT/HEADROOM_HOST) are owned by the
         # install manifest and must be rendered read-only. Foreground proxies

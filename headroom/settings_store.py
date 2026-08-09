@@ -518,7 +518,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "OpenRouter Fallback",
         "str",
         default=None,
-        help="OpenRouter model used for any Anthropic model NOT in the model mapping (e.g. 'openai/gpt-4o', 'deepseek/deepseek-chat-v4'). When unset, unmatched models auto-prefix anthropic/<model>.",
+        help="OpenRouter model used for any Anthropic model NOT in the model mapping (e.g. 'openai/gpt-4o', 'deepseek/deepseek-chat-v4'). When unset, unmatched models auto-prefix anthropic/<model>. Matches family keys like 'sonnet-5' too.",
         tier="basic",
     ),
     SettingField(
@@ -528,7 +528,7 @@ SETTINGS: tuple[SettingField, ...] = (
         "OpenRouter Fallback",
         "model-map",
         default=None,
-        help="Maps Anthropic model IDs to OpenRouter equivalents. Unmapped models use the default fallback model, or auto-prefix anthropic/<model>.",
+        help="Maps Anthropic models to OpenRouter equivalents. Keys may be model families like 'sonnet-5', 'opus-4-8', 'fable-5' (any version in that family matches) or full Anthropic IDs as an exact override. Unmapped models use the default fallback model, or auto-prefix anthropic/<model>. Matching is case- and whitespace-insensitive.",
         tier="advanced",
     ),
     SettingField(
