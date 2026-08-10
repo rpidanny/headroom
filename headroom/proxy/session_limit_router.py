@@ -279,7 +279,10 @@ class SessionLimitRouter:
             return self._model_map_normalized[norm]
         # 2. Family match: the incoming model's family resolves against any
         # family-style key in the map (bare slug or undated claude- pin).
-        family = _anthropic_model_family(anthropic_model)
+        # Uses the normalized (case-folded) form so oddly-cased incoming
+        # model IDs (e.g. "Claude-Sonnet-5") still resolve to their family,
+        # consistent with the case-insensitive exact-match step above.
+        family = _anthropic_model_family(norm)
         if family is not None:
             family_norm = _normalize_key(family)
             if family_norm in self._family_map:

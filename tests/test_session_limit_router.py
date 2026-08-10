@@ -193,6 +193,19 @@ class TestMapModel:
         )
         assert router.map_model("claude-sonnet-4-5-20250929") == "deepseek/deepseek-chat-v4"
 
+    def test_incoming_model_case_insensitive_for_family_match(self):
+        # The map key is lowercase, but the incoming model ID is oddly cased.
+        # Family resolution must case-fold the incoming model too, not just
+        # the map keys.
+        router = SessionLimitRouter(
+            config=_config(
+                session_limit_fallback_model_map={"sonnet-5": "deepseek/deepseek-chat-v4"}
+            ),
+            subscription_tracker=None,
+        )
+        assert router.map_model("Claude-Sonnet-5") == "deepseek/deepseek-chat-v4"
+        assert router.map_model("CLAUDE-SONNET-5[1M]") == "deepseek/deepseek-chat-v4"
+
     # -- undated claude- pins act as family keys --
 
     def test_undated_claude_pin_is_a_family_key(self):
