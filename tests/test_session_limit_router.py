@@ -18,12 +18,14 @@ def _config(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _tracker_with_snapshot(five_hour_pct: float = 0.0, seven_day_pct: float = 0.0):
+def _tracker_with_snapshot(
+    five_hour_pct: float = 0.0, seven_day_pct: float = 0.0, is_available: bool = True
+):
     snapshot = SubscriptionSnapshot(
         five_hour=RateLimitWindow(utilization_pct=five_hour_pct),
         seven_day=RateLimitWindow(utilization_pct=seven_day_pct),
     )
-    return SimpleNamespace(latest_snapshot=snapshot)
+    return SimpleNamespace(latest_snapshot=snapshot, is_available=lambda: is_available)
 
 
 class TestIsFallbackActive:
@@ -343,3 +345,128 @@ class TestGetBackendCredentialGuard:
             default_backend=default_backend,
         )
         assert router.get_backend("claude-x", existing_backend=None) is default_backend
+
+
+class TestGetStats:
+    def test_disabled(self):
+        router = SessionLimitRouter(
+            config=_config(session_limit_fallback_enabled=False),
+            subscription_tracker=_tracker_with_snapshot(99.0, 99.0),
+        )
+        assert router.get_stats() == {
+            "enabled": False,
+            "active": False,
+            "activation_status": "disabled",
+            "backend_status": "ok",
+        }
+
+    def test_tracking_disabled_when_tracker_unavailable(self):
+        router = SessionLimitRouter(
+            config=_config(),
+            subscription_tracker=_tracker_with_snapshot(0.0, 0.0, is_available=False),
+        )
+        stats = router.get_stats()
+        assert stats["activation_status"] == "tracking_disabled"
+        assert stats["active"] is False
+
+    def test_tracking_disabled_when_no_tracker(self):
+        router = SessionLimitRouter(config=_config(), subscription_tracker=None)
+        stats = router.get_stats()
+        assert stats["activation_status"] == "tracking_disabled"
+
+    def test_awaiting_data_when_no_snapshot_yet(self):
+        router = SessionLimitRouter(
+            config=_config(),
+            subscription_tracker=SimpleNamespace(
+                latest_snapshot=None, is_available=lambda: True
+            ),
+        )
+        stats = router.get_stats()
+        assert stats["activation_status"] == "awaiting_data"
+        assert stats["current_utilization_pct"] is None
+
+    def test_ready_and_utilization_reported(self):
+        router = SessionLimitRouter(
+            config=_config(), subscription_tracker=_tracker_with_snapshot(50.0, 20.0)
+        )
+        stats = router.get_stats()
+        assert stats["activation_status"] == "ready"
+        assert stats["active"] is False
+        assert stats["five_hour_utilization_pct"] == 50.0
+        assert stats["seven_day_utilization_pct"] == 20.0
+        assert stats["current_utilization_pct"] == 50.0
+
+    def test_backend_status_unconfigured_stays_sticky_no_auto_retry(self, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        router = SessionLimitRouter(
+            config=_config(), subscription_tracker=_tracker_with_snapshot(99.0, 0.0)
+        )
+        router.get_backend("claude-x", existing_backend=None)
+        assert router.get_stats()["backend_status"] == "unconfigured"
+
+        # Setting the key afterward must NOT recover without a restart —
+        # the failure is sticky by design.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        router.get_backend("claude-x", existing_backend=None)
+        assert router.get_stats()["backend_status"] == "unconfigured"
+
+    def test_backend_status_failed_on_construction_error(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        router = SessionLimitRouter(
+            config=_config(), subscription_tracker=_tracker_with_snapshot(99.0, 0.0)
+        )
+        with patch("headroom.backends.litellm.LiteLLMBackend", side_effect=RuntimeError("boom")):
+            router.get_backend("claude-x", existing_backend=None)
+        assert router.get_stats()["backend_status"] == "failed"
+
+    def test_backend_status_ok_when_built(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        router = SessionLimitRouter(
+            config=_config(), subscription_tracker=_tracker_with_snapshot(99.0, 0.0)
+        )
+        with patch("headroom.backends.litellm.LiteLLMBackend") as mock_backend_cls:
+            mock_backend_cls.return_value = SimpleNamespace(name="litellm-openrouter")
+            router.get_backend("claude-x", existing_backend=None)
+        assert router.get_stats()["backend_status"] == "ok"
+
+    def test_fallback_request_count_increments_only_on_actual_routing(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        router = SessionLimitRouter(
+            config=_config(), subscription_tracker=_tracker_with_snapshot(99.0, 0.0)
+        )
+        with patch("headroom.backends.litellm.LiteLLMBackend") as mock_backend_cls:
+            mock_backend_cls.return_value = SimpleNamespace(name="litellm-openrouter")
+            router.get_backend("claude-x", existing_backend=None)
+            router.get_backend("claude-x", existing_backend=None)
+            # A route-advice backend already set bypasses the fallback path.
+            router.get_backend("claude-x", existing_backend=object())
+        assert router.get_stats()["fallback_request_count"] == 2
+
+    def test_last_triggered_at_heartbeat(self):
+        router = SessionLimitRouter(
+            config=_config(), subscription_tracker=_tracker_with_snapshot(0.0, 0.0)
+        )
+        assert router.get_stats()["last_triggered_at"] is None
+
+        tracker = _tracker_with_snapshot(99.0, 0.0)
+        router = SessionLimitRouter(config=_config(), subscription_tracker=tracker)
+        first = router.get_stats()["last_triggered_at"]
+        assert first is not None
+        # Re-evaluating while still active refreshes the heartbeat rather
+        # than only recording the first inactive->active transition.
+        second = router.get_stats()["last_triggered_at"]
+        assert second is not None
+
+
+def test_registers_with_quota_registry():
+    from headroom.subscription.base import QuotaTrackerRegistry
+
+    router = SessionLimitRouter(
+        config=_config(), subscription_tracker=_tracker_with_snapshot(0.0, 0.0)
+    )
+    registry = QuotaTrackerRegistry()
+    registry.register(router)
+
+    all_stats = registry.get_all_stats()
+    assert "session_limit_fallback" in all_stats
+    assert all_stats["session_limit_fallback"]["enabled"] is True

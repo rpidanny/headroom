@@ -893,6 +893,9 @@
                                                 <div class="px-4 py-3 font-mono text-gray-400 truncate" x-text="formatTime(req.timestamp)"></div>
                                                 <div class="px-4 py-3 min-w-0">
                                                     <span class="px-2 py-0.5 bg-border rounded text-xs truncate" x-text="truncateModel(req.model)"></span>
+                                                    <template x-if="req.provider === 'openrouter'">
+                                                        <span class="ml-1 px-1.5 py-0.5 bg-amber-500/20 text-amber-400 rounded text-[10px] uppercase tracking-wide">Fallback</span>
+                                                    </template>
                                                 </div>
                                                 <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.input_tokens_optimized)"></div>
                                                 <div class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(req.output_tokens || 0)"></div>
@@ -971,8 +974,32 @@
                                 <span class="w-2 h-2 rounded-full pulse-live"
                                       :class="stats.subscription_window.last_active_at ? 'bg-emerald-400' : 'bg-gray-600'"></span>
                                 <span class="text-xs text-gray-500" x-text="stats.subscription_window.last_active_at ? 'Active' : 'Idle'"></span>
+                                <template x-if="stats.session_limit_fallback && stats.session_limit_fallback.enabled">
+                                    <span class="flex items-center gap-1.5 ml-3 pl-3 border-l border-border">
+                                        <span class="w-2 h-2 rounded-full pulse-live"
+                                              :class="stats.session_limit_fallback.active ? 'bg-amber-400' : 'bg-gray-600'"></span>
+                                        <span class="text-xs text-gray-500" x-text="stats.session_limit_fallback.active ? 'Fallback Active' : 'Fallback Standby'"></span>
+                                    </span>
+                                </template>
                             </div>
                         </div>
+
+                        <!-- OpenRouter fallback misconfiguration warning -->
+                        <template x-if="stats.session_limit_fallback && stats.session_limit_fallback.enabled && stats.session_limit_fallback.activation_status === 'tracking_disabled'">
+                            <div class="mb-3 px-3 py-2 rounded bg-red-500/10 border border-red-500/30 text-xs text-red-400">
+                                OpenRouter fallback is enabled, but subscription tracking is off — fallback can never activate. Enable subscription tracking too.
+                            </div>
+                        </template>
+                        <template x-if="stats.session_limit_fallback && stats.session_limit_fallback.enabled && stats.session_limit_fallback.activation_status !== 'tracking_disabled' && stats.session_limit_fallback.backend_status === 'unconfigured'">
+                            <div class="mb-3 px-3 py-2 rounded bg-red-500/10 border border-red-500/30 text-xs text-red-400">
+                                OpenRouter fallback is enabled but <code>OPENROUTER_API_KEY</code> is not set — requests stay on direct Anthropic. Set the key in Settings and restart the proxy.
+                            </div>
+                        </template>
+                        <template x-if="stats.session_limit_fallback && stats.session_limit_fallback.enabled && stats.session_limit_fallback.activation_status !== 'tracking_disabled' && stats.session_limit_fallback.backend_status === 'failed'">
+                            <div class="mb-3 px-3 py-2 rounded bg-red-500/10 border border-red-500/30 text-xs text-red-400">
+                                OpenRouter fallback failed to initialize and will not retry until the proxy restarts.
+                            </div>
+                        </template>
 
                         <!-- 5h / 7d progress bars -->
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
@@ -985,10 +1012,15 @@
                                               :class="stats.subscription_window.latest.five_hour.utilization_pct > 80 ? 'text-red-400' : stats.subscription_window.latest.five_hour.utilization_pct > 60 ? 'text-amber-400' : 'text-emerald-400'"
                                               x-text="(stats.subscription_window.latest.five_hour.utilization_pct || 0).toFixed(1) + '%'"></span>
                                     </div>
-                                    <div class="w-full h-3 bg-border rounded-full overflow-hidden">
+                                    <div class="w-full h-3 bg-border rounded-full overflow-hidden relative">
                                         <div class="h-full rounded-full transition-all duration-500"
                                              :class="stats.subscription_window.latest.five_hour.utilization_pct > 80 ? 'bg-red-500' : stats.subscription_window.latest.five_hour.utilization_pct > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
                                              :style="'width: ' + Math.min(stats.subscription_window.latest.five_hour.utilization_pct || 0, 100) + '%'"></div>
+                                        <template x-if="stats.session_limit_fallback && stats.session_limit_fallback.enabled">
+                                            <div class="absolute top-0 bottom-0 w-px bg-amber-300/80"
+                                                 :style="'left: ' + Math.min(stats.session_limit_fallback.threshold * 100, 100) + '%'"
+                                                 title="OpenRouter fallback threshold"></div>
+                                        </template>
                                     </div>
                                     <div class="text-xs text-gray-500 mt-1"
                                          x-text="'Resets in ' + formatResetTime(stats.subscription_window.latest.five_hour.seconds_to_reset)"></div>
@@ -1004,10 +1036,15 @@
                                               :class="stats.subscription_window.latest.seven_day.utilization_pct > 80 ? 'text-red-400' : stats.subscription_window.latest.seven_day.utilization_pct > 60 ? 'text-amber-400' : 'text-emerald-400'"
                                               x-text="(stats.subscription_window.latest.seven_day.utilization_pct || 0).toFixed(1) + '%'"></span>
                                     </div>
-                                    <div class="w-full h-3 bg-border rounded-full overflow-hidden">
+                                    <div class="w-full h-3 bg-border rounded-full overflow-hidden relative">
                                         <div class="h-full rounded-full transition-all duration-500"
                                              :class="stats.subscription_window.latest.seven_day.utilization_pct > 80 ? 'bg-red-500' : stats.subscription_window.latest.seven_day.utilization_pct > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
                                              :style="'width: ' + Math.min(stats.subscription_window.latest.seven_day.utilization_pct || 0, 100) + '%'"></div>
+                                        <template x-if="stats.session_limit_fallback && stats.session_limit_fallback.enabled">
+                                            <div class="absolute top-0 bottom-0 w-px bg-amber-300/80"
+                                                 :style="'left: ' + Math.min(stats.session_limit_fallback.threshold * 100, 100) + '%'"
+                                                 title="OpenRouter fallback threshold"></div>
+                                        </template>
                                     </div>
                                     <div class="text-xs text-gray-500 mt-1"
                                          x-text="'Resets in ' + formatResetTime(stats.subscription_window.latest.seven_day.seconds_to_reset)"></div>
@@ -1087,6 +1124,16 @@
                                     <div class="text-xs mb-1"
                                          :class="d.severity === 'alert' ? 'text-red-400' : 'text-amber-400'"
                                          x-text="d.description"></div>
+                                </template>
+                            </div>
+                        </template>
+
+                        <!-- OpenRouter fallback usage -->
+                        <template x-if="stats.session_limit_fallback && stats.session_limit_fallback.enabled && stats.session_limit_fallback.fallback_request_count > 0">
+                            <div class="border-t border-border pt-3 mt-3 text-xs text-gray-500">
+                                Routed via OpenRouter fallback: <span class="text-gray-300 font-mono" x-text="formatNumber(stats.session_limit_fallback.fallback_request_count)"></span> requests
+                                <template x-if="stats.session_limit_fallback.last_triggered_at">
+                                    <span> &middot; last active <span x-text="formatTime(stats.session_limit_fallback.last_triggered_at)"></span></span>
                                 </template>
                             </div>
                         </template>

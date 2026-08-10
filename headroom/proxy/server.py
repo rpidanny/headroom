@@ -1878,6 +1878,7 @@ class HeadroomProxy(
             subscription_tracker=get_subscription_tracker(),
             default_backend=self.anthropic_backend,
         )
+        registry.register(self.session_limit_router)
         if self.config.session_limit_fallback_enabled:
             logger.info(
                 "Session-limit fallback: ENABLED "

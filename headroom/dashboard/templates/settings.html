@@ -80,6 +80,35 @@
                 <template x-for="group in groups.filter(g => fieldsIn(g).length > 0)" :key="group">
                     <div class="card rounded-lg p-5 mb-4">
                         <h2 class="text-sm font-semibold uppercase tracking-wide field-help mb-4" x-text="group"></h2>
+                        <template x-if="group === 'OpenRouter Fallback' && fallbackStats">
+                            <div class="mb-4 px-3 py-2 rounded border border-border text-xs">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <span class="w-2 h-2 rounded-full"
+                                          :class="fallbackStats.active ? 'bg-amber-400' : 'bg-gray-600'"></span>
+                                    <span class="font-medium"
+                                          x-text="!fallbackStats.enabled ? 'Disabled' : (fallbackStats.active ? 'Currently ACTIVE' : 'Enabled, standing by')"></span>
+                                </div>
+                                <template x-if="fallbackStats.enabled">
+                                    <div class="field-help">
+                                        Utilization: <span x-text="(fallbackStats.current_utilization_pct || 0).toFixed(1) + '%'"></span>
+                                        / threshold <span x-text="(fallbackStats.threshold * 100).toFixed(0) + '%'"></span>
+                                        &middot; Routed requests: <span x-text="fallbackStats.fallback_request_count"></span>
+                                        <template x-if="fallbackStats.last_triggered_at">
+                                            <span> &middot; last triggered <span x-text="formatRelativeTime(fallbackStats.last_triggered_at)"></span></span>
+                                        </template>
+                                    </div>
+                                </template>
+                                <div class="text-red-400 mt-1" x-show="fallbackStats.activation_status === 'tracking_disabled'">
+                                    Subscription tracking is off — fallback can never activate. Enable subscription tracking too.
+                                </div>
+                                <div class="text-red-400 mt-1" x-show="fallbackStats.activation_status !== 'tracking_disabled' && fallbackStats.backend_status === 'unconfigured'">
+                                    Missing OPENROUTER_API_KEY — set it below, then Apply &amp; Restart.
+                                </div>
+                                <div class="text-red-400 mt-1" x-show="fallbackStats.activation_status !== 'tracking_disabled' && fallbackStats.backend_status === 'failed'">
+                                    Backend failed to initialize; restart required after fixing the config.
+                                </div>
+                            </div>
+                        </template>
                         <template x-for="field in fieldsIn(group)" :key="field.key">
                             <div class="mb-4 last:mb-0">
                                 <label class="flex items-center justify-between gap-4">
@@ -248,6 +277,7 @@
                 anthropicModels: [],  // known Claude model IDs for autocomplete (from /settings/schema)
                 anthropicModelFamilies: [],  // known Claude family slugs (sonnet-5, opus-4-8, …)
                 modelKeySuggestions: [],  // families-first + full IDs for the combined datalist
+                fallbackStats: null,  // live session_limit_fallback state from /stats, best-effort
 
                 async init() {
                     try {
@@ -284,9 +314,29 @@
                     } catch (e) {
                         this.loadError = 'Failed to load settings: ' + e.message;
                     }
+
+                    // Best-effort live-state readout for the OpenRouter Fallback
+                    // group. Settings must remain usable even if /stats is
+                    // unreachable, so failures here are silently ignored.
+                    try {
+                        const statsRes = await fetch('/stats?cached=1');
+                        if (statsRes.ok) {
+                            const stats = await statsRes.json();
+                            this.fallbackStats = stats.session_limit_fallback || null;
+                        }
+                    } catch (e) { /* non-fatal */ }
                 },
 
                 fieldsIn(group) { return this.fields.filter(f => f.group === group && f.tier === this.activeTab); },
+
+                formatRelativeTime(ts) {
+                    if (!ts) return '-';
+                    const d = new Date(ts);
+                    const diff = (Date.now() - d) / 1000;
+                    if (diff < 60) return Math.floor(diff) + 's ago';
+                    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+                    return d.toLocaleTimeString();
+                },
 
                 parseModelRows(jsonStr) {
                     if (!jsonStr) return [];

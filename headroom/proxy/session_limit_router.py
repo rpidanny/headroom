@@ -33,7 +33,11 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+from datetime import datetime, timezone
 from typing import Any
+
+from headroom.subscription.base import QuotaTracker
 
 logger = logging.getLogger(__name__)
 
@@ -119,13 +123,20 @@ def _anthropic_model_family(anthropic_model: str) -> str | None:
     return s or None
 
 
-class SessionLimitRouter:
+class SessionLimitRouter(QuotaTracker):
     """Routes requests to OpenRouter when the Anthropic session limit is hit.
 
     This is a per-proxy-instance object that reads the subscription tracker's
     latest snapshot on every request. When the five-hour or seven-day window
     utilization reaches the threshold, it lazily builds an OpenRouter
     LiteLLM backend and maps the model to the OpenRouter naming convention.
+
+    Also implements :class:`~headroom.subscription.base.QuotaTracker` so it
+    can register with the process-global quota registry — this surfaces its
+    live state (active/inactive, threshold, backend health) under the
+    ``session_limit_fallback`` key in ``/stats`` with zero server-side
+    aggregation changes, the same mechanism the Anthropic/Codex/Copilot
+    quota trackers already use.
 
     Args:
         config: The proxy configuration object.
@@ -134,6 +145,9 @@ class SessionLimitRouter:
         default_backend: The native ``anthropic_backend`` (or None for
             direct API). Returned when fallback is not active.
     """
+
+    key = "session_limit_fallback"
+    label = "OpenRouter Session-Limit Fallback"
 
     def __init__(
         self,
@@ -170,6 +184,12 @@ class SessionLimitRouter:
 
         self._backend: Any = None
         self._backend_failed: bool = False
+        self._backend_failed_reason: str | None = None
+
+        # Live-state bookkeeping for `get_stats()` (dashboard/settings UI).
+        self._lock = threading.Lock()
+        self._last_triggered_at: datetime | None = None
+        self._fallback_request_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -180,7 +200,10 @@ class SessionLimitRouter:
         """Whether the session limit threshold has been exceeded.
 
         Returns False when tracking is disabled, no snapshot is available,
-        or all windows are below the configured threshold.
+        or all windows are below the configured threshold. Updates
+        ``_last_triggered_at`` (a heartbeat, refreshed on every check that
+        finds fallback active — not just the inactive->active transition)
+        for the ``last_triggered_at`` field in `get_stats()`.
         """
         if not self._enabled:
             return False
@@ -200,6 +223,8 @@ class SessionLimitRouter:
 
         active = five_hour >= threshold_pct or seven_day >= threshold_pct
         if active:
+            with self._lock:
+                self._last_triggered_at = datetime.now(timezone.utc)
             logger.info(
                 "SessionLimitRouter: fallback ACTIVE "
                 "(5h=%.1f%%, 7d=%.1f%%, threshold=%.0f%%)",
@@ -216,6 +241,85 @@ class SessionLimitRouter:
                 threshold_pct,
             )
         return active
+
+    def is_available(self) -> bool:
+        """Always register with the quota registry.
+
+        Unlike other trackers where ``is_available() == False`` means "omit
+        this key entirely," ``enabled: False`` in :meth:`get_stats` is
+        itself meaningful UI state (the dashboard needs to render a
+        "disabled" indicator, not silently show nothing).
+        """
+        return True
+
+    def get_stats(self) -> dict[str, Any] | None:
+        """Live fallback state for the ``session_limit_fallback`` stats key.
+
+        Reports two independent status axes:
+
+        * ``activation_status`` — whether fallback can ever trigger, driven
+          by the subscription tracker (disabled / tracking not enabled /
+          awaiting first poll / ready).
+        * ``backend_status`` — whether the OpenRouter backend can actually
+          be built, driven by credentials/construction (unconfigured /
+          failed / ok). Independent of ``activation_status`` because a
+          missing API key and disabled subscription tracking are different
+          problems with different fixes.
+        """
+        if not self._enabled:
+            return {
+                "enabled": False,
+                "active": False,
+                "activation_status": "disabled",
+                "backend_status": "ok",
+            }
+
+        tracker = self._subscription_tracker
+        tracking_available = tracker is not None and tracker.is_available()
+        snapshot = tracker.latest_snapshot if tracking_available and tracker else None
+
+        if not tracking_available:
+            activation_status = "tracking_disabled"
+        elif snapshot is None:
+            activation_status = "awaiting_data"
+        else:
+            activation_status = "ready"
+
+        five_hour_pct = snapshot.five_hour.utilization_pct if snapshot else None
+        seven_day_pct = snapshot.seven_day.utilization_pct if snapshot else None
+        utilization_pct = max(
+            (p for p in (five_hour_pct, seven_day_pct) if p is not None), default=None
+        )
+
+        if self._backend is not None:
+            backend_status = "ok"
+        elif self._backend_failed_reason == "unconfigured":
+            backend_status = "unconfigured"
+        elif self._backend_failed_reason == "error":
+            backend_status = "failed"
+        else:
+            backend_status = "ok"  # not yet attempted
+
+        # Evaluate BEFORE reading `_last_triggered_at` — this property has a
+        # side effect (refreshes the heartbeat when active), so reading the
+        # timestamp first would report last call's value, not this one's.
+        active = self.is_fallback_active
+        with self._lock:
+            last_triggered = self._last_triggered_at
+            count = self._fallback_request_count
+
+        return {
+            "enabled": True,
+            "active": active,
+            "activation_status": activation_status,
+            "threshold": self._threshold,
+            "five_hour_utilization_pct": five_hour_pct,
+            "seven_day_utilization_pct": seven_day_pct,
+            "current_utilization_pct": utilization_pct,
+            "backend_status": backend_status,
+            "last_triggered_at": last_triggered.isoformat() if last_triggered else None,
+            "fallback_request_count": count,
+        }
 
     def get_backend(
         self,
@@ -244,6 +348,8 @@ class SessionLimitRouter:
         if backend is None:
             return self._default_backend
 
+        with self._lock:
+            self._fallback_request_count += 1
         return backend
 
     def map_model(self, anthropic_model: str) -> str:
@@ -326,6 +432,7 @@ class SessionLimitRouter:
                 "cannot activate OpenRouter fallback"
             )
             self._backend_failed = True
+            self._backend_failed_reason = "unconfigured"
             return None
 
         try:
@@ -336,6 +443,7 @@ class SessionLimitRouter:
         except Exception as exc:
             logger.warning("SessionLimitRouter: failed to build OpenRouter backend (%s)", exc)
             self._backend_failed = True
+            self._backend_failed_reason = "error"
             return None
 
         return self._backend
