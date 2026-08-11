@@ -752,6 +752,38 @@ SETTINGS: tuple[SettingField, ...] = (
 
 _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}
 
+# Snapshot of the curated env vars as they were BEFORE this process's first
+# `apply_to_environ()` mutation -- i.e. whatever the shell/service/docker
+# `--env` actually exported, with none of our own setdefault mirroring mixed
+# in. Captured lazily (once) so `to_schema()`'s `env_override` flag can tell
+# a real external override apart from `apply_to_environ()` simply copying a
+# stored settings.json value into os.environ so downstream env-driven readers
+# (Click, `_get_env_bool`, etc.) pick it up. Without this, saving a value once
+# makes every later edit look "environment-overridden" and get silently
+# dropped by the dashboard (which disables/skips fields it thinks are locked).
+_pristine_environ: dict[str, str] | None = None
+
+
+def _capture_pristine_environ() -> None:
+    global _pristine_environ
+    if _pristine_environ is None:
+        _pristine_environ = {
+            field.env: os.environ[field.env] for field in SETTINGS if field.env in os.environ
+        }
+
+
+def is_env_overridden(field: SettingField) -> bool:
+    """Whether ``field.env`` was set in the environment externally.
+
+    "Externally" means before Headroom's own settings.json values were ever
+    mirrored into ``os.environ`` by :func:`apply_to_environ` -- a real shell
+    export, Docker ``--env``, or systemd ``Environment=``, not our own
+    setdefault echoing the stored file value back into the process env.
+    """
+    _capture_pristine_environ()
+    assert _pristine_environ is not None
+    return field.env in _pristine_environ
+
 
 class SettingsValidationError(Exception):
     """Raised when a settings payload has unknown keys or invalid values.
@@ -955,6 +987,7 @@ def save(values: dict[str, Any]) -> None:
 
 def apply_to_environ(values: dict[str, Any]) -> None:
     """``setdefault`` each stored value into ``os.environ`` (explicit export wins)."""
+    _capture_pristine_environ()
     for key, value in values.items():
         field = _BY_KEY.get(key)
         if field is None or value is None:
@@ -1018,7 +1051,7 @@ def to_schema() -> dict[str, Any]:
                 "minimum": field.minimum,
                 "maximum": field.maximum,
                 "tier": field.tier,
-                "env_override": bool(os.environ.get(field.env)),
+                "env_override": is_env_overridden(field),
                 "value": _mask(field, effective.get(field.key)),
                 "stored": _mask(field, stored.get(field.key)),
             }

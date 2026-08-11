@@ -26,6 +26,10 @@ def workspace(tmp_path, monkeypatch):
 def _clear_env(monkeypatch):
     for field in settings_store.SETTINGS:
         monkeypatch.delenv(field.env, raising=False)
+    # `_pristine_environ` is a module-level snapshot captured once per process
+    # (real usage: once per proxy run). Reset it so each test's "process" gets
+    # its own fresh pristine baseline from whatever env state it sets up next.
+    monkeypatch.setattr(settings_store, "_pristine_environ", None)
 
 
 class TestRoundTrip:
@@ -143,6 +147,51 @@ class TestEffectiveValues:
         # env overrides file
         monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "general")
         assert settings_store.effective_values()["savings_profile"] == "general"
+
+
+class TestEnvOverrideDetection:
+    """`to_schema()`'s `env_override` must reflect a real external export, not
+    `apply_to_environ()`'s own setdefault mirroring of a stored value into
+    os.environ -- otherwise the dashboard treats every saved field as
+    environment-locked after its first restart and silently drops edits."""
+
+    def test_apply_to_environ_mirroring_is_not_env_override(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"session_limit_fallback_model_map": '{"sonnet-5": "openai/gpt-4o"}'})
+        # Simulates process startup: apply_to_environ mirrors the stored file
+        # value into os.environ so env-driven readers (Click, _get_env_bool)
+        # pick it up -- this must NOT be mistaken for an external override.
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ["HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP"]
+
+        schema = settings_store.to_schema()
+        field = next(
+            f for f in schema["fields"] if f["key"] == "session_limit_fallback_model_map"
+        )
+        assert field["env_override"] is False
+
+    def test_real_external_export_is_env_override(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv(
+            "HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP", '{"sonnet-5": "z-ai/glm-5.2"}'
+        )
+        settings_store.apply_to_environ(settings_store.load())
+
+        schema = settings_store.to_schema()
+        field = next(
+            f for f in schema["fields"] if f["key"] == "session_limit_fallback_model_map"
+        )
+        assert field["env_override"] is True
+
+    def test_to_schema_before_any_apply_still_detects_export(self, workspace, monkeypatch):
+        """`to_schema()` may run before `apply_to_environ()` in-process (e.g. a
+        test, or an embedded caller) -- the pristine snapshot must still be
+        captured correctly the first time either function touches it."""
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_PORT", "7777")
+        schema = settings_store.to_schema()
+        field = next(f for f in schema["fields"] if f["key"] == "port")
+        assert field["env_override"] is True
 
 
 class TestSecretMasking:
