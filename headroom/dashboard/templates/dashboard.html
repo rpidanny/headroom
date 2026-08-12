@@ -1903,8 +1903,6 @@
                 },
 
                 async pollDashboard(force = false) {
-                    if (!force && document.hidden) return;
-
                     await this.fetchStats();
 
                     const now = Date.now();
