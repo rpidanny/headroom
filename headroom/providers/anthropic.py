@@ -88,6 +88,8 @@ def sanitize_anthropic_model_metadata(value: Any) -> Any:
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
     # Claude Fable 5 - 1M context
     "claude-fable-5": 1000000,
+    # Claude Opus 5 - 1M context
+    "claude-opus-5": 1000000,
     # Claude Opus 4.8 - 1M context
     "claude-opus-4-8": 1000000,
     # Claude 4.7 (Opus 4.7) - 1M context

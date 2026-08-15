@@ -89,11 +89,12 @@ class TestAnthropicModelFallback:
         """Test pattern-based inference for opus models."""
         provider = AnthropicProvider()
 
-        # Future opus model should infer 200K and opus pricing
-        limit = provider.get_context_limit("claude-opus-5-20260101")
+        # Future opus model (opus-5 is now known, so use a later placeholder)
+        # should infer 200K and opus pricing.
+        limit = provider.get_context_limit("claude-opus-6-20270101")
         assert limit == 200000
 
-        pricing = provider._get_pricing("claude-opus-5-20260101")
+        pricing = provider._get_pricing("claude-opus-6-20270101")
         assert pricing["input"] == 5.00
         assert pricing["output"] == 25.00
 

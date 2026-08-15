@@ -115,6 +115,15 @@ class TestMapModel:
         )
         assert router.map_model("claude-opus-4-8") == "openai/gpt-4o"
 
+    def test_family_match_opus_5(self):
+        router = SessionLimitRouter(
+            config=_config(
+                session_limit_fallback_model_map={"opus-5": "openai/gpt-4o"}
+            ),
+            subscription_tracker=None,
+        )
+        assert router.map_model("claude-opus-5") == "openai/gpt-4o"
+
     def test_family_match_fable_5(self):
         router = SessionLimitRouter(
             config=_config(
@@ -275,6 +284,7 @@ class TestFamilyExtraction:
         assert fam("claude-sonnet-4-5-20250929") == "sonnet-4-5"
         assert fam("claude-opus-4-8") == "opus-4-8"
         assert fam("claude-opus-4-5-20251101") == "opus-4-5"
+        assert fam("claude-opus-5") == "opus-5"
         assert fam("claude-fable-5") == "fable-5"
         assert fam("claude-haiku-4-5-20251001") == "haiku-4-5"
 

@@ -323,7 +323,7 @@ class TestOpenRouterFallbackSchema:
         assert isinstance(body["anthropic_model_families"], list)
         assert len(body["anthropic_model_families"]) > 0
         # Family slugs derived from the known model IDs.
-        for fam in ("sonnet-5", "opus-4-8", "fable-5", "haiku-4-5"):
+        for fam in ("sonnet-5", "opus-5", "opus-4-8", "fable-5", "haiku-4-5"):
             assert fam in body["anthropic_model_families"], f"missing family {fam}"
         # Full IDs must not leak into the family list.
         assert "claude-sonnet-4-5-20250929" not in body["anthropic_model_families"]
