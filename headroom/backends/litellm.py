@@ -434,8 +434,39 @@ def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
     written to the prompt cache. Without this mapping a working Bedrock prompt
     cache is invisible to non-streaming clients: they see the full prompt count
     and no cache fields, which looks exactly like the cache being broken
-    (see #1345). The streaming/OpenAI paths already surface these fields.
+    (see #1345). The streaming/OpenAI paths already surface these cache fields.
+
+    Handles both object-style (LiteLLM Usage dataclass) and dict-style usage
+    since some providers / LiteLLM versions may return either format.
     """
+    if litellm_usage is None:
+        return {"input_tokens": 0, "output_tokens": 0}
+
+    if isinstance(litellm_usage, dict):
+        return _anthropic_usage_from_litellm_dict(litellm_usage)
+
+    return _anthropic_usage_from_litellm_obj(litellm_usage)
+
+
+def _anthropic_usage_from_litellm_dict(litellm_usage: dict[str, Any]) -> dict[str, Any]:
+    cache_read = int(litellm_usage.get("cache_read_input_tokens", 0) or 0)
+    cache_write = int(litellm_usage.get("cache_creation_input_tokens", 0) or 0)
+    details = litellm_usage.get("prompt_tokens_details")
+    if details is not None:
+        cache_read = cache_read or int(details.get("cached_tokens", 0) or 0)
+        cache_write = cache_write or int(details.get("cache_creation_tokens", 0) or 0)
+    prompt_tokens = int(litellm_usage.get("prompt_tokens", 0) or 0)
+    usage: dict[str, Any] = {
+        "input_tokens": max(prompt_tokens - cache_read - cache_write, 0),
+        "output_tokens": int(litellm_usage.get("completion_tokens", 0) or 0),
+    }
+    if cache_read or cache_write:
+        usage["cache_read_input_tokens"] = cache_read
+        usage["cache_creation_input_tokens"] = cache_write
+    return usage
+
+
+def _anthropic_usage_from_litellm_obj(litellm_usage: Any) -> dict[str, Any]:
     cache_read = int(getattr(litellm_usage, "cache_read_input_tokens", 0) or 0)
     cache_write = int(getattr(litellm_usage, "cache_creation_input_tokens", 0) or 0)
     details = getattr(litellm_usage, "prompt_tokens_details", None)
@@ -682,6 +713,7 @@ class LiteLLMBackend(Backend):
                 text_parts = []
                 tool_use_blocks = []
                 tool_result_blocks = []
+                thinking_blocks = []
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -693,6 +725,13 @@ class LiteLLMBackend(Backend):
                         tool_use_blocks.append(block)
                     elif block_type == "tool_result":
                         tool_result_blocks.append(block)
+                    elif block_type in ("thinking", "redacted_thinking"):
+                        # Extended-thinking history must round-trip verbatim
+                        # (signature/data included) or the provider rejects the
+                        # next turn ("thinking block required"). Dropping these
+                        # silently (as before) also strands the signature that
+                        # proves the reasoning wasn't tampered with.
+                        thinking_blocks.append(block)
 
                 # tool_result blocks → OpenAI "tool" role messages
                 if tool_result_blocks:
@@ -741,12 +780,17 @@ class LiteLLMBackend(Backend):
                         }
                         for tu in tool_use_blocks
                     ]
+                    if thinking_blocks:
+                        assistant_msg["thinking_blocks"] = thinking_blocks
                     converted.append(assistant_msg)
                     continue
 
                 # Simple text only
-                if text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
+                if text_parts or thinking_blocks:
+                    text_msg: dict[str, Any] = {"role": role, "content": "\n".join(text_parts)}
+                    if thinking_blocks:
+                        text_msg["thinking_blocks"] = thinking_blocks
+                    converted.append(text_msg)
                 else:
                     converted.append({"role": role, "content": ""})
 
@@ -883,6 +927,20 @@ class LiteLLMBackend(Backend):
                 kwargs["top_p"] = body["top_p"]
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
+            if "thinking" in body:
+                # Extended thinking (litellm.acompletion has a native `thinking`
+                # param). Without this, Claude Code's thinking-enabled requests
+                # (temperature=1, a large max_tokens sized for budget_tokens +
+                # answer) get sent as plain completions: the model may spend the
+                # whole max_tokens budget on invisible reasoning and return only
+                # a token or two of visible content (#1907).
+                # `drop_params` makes litellm silently drop `thinking` instead of
+                # raising UnsupportedParamsError for targets that don't support
+                # it (e.g. non-reasoning OpenRouter fallback models). Reasoning-
+                # capable models (Anthropic native, Bedrock Claude, OpenRouter
+                # anthropic/*) still get it forwarded/translated normally.
+                kwargs["thinking"] = body["thinking"]
+                kwargs["drop_params"] = True
 
             # Tools (convert Anthropic format to OpenAI format)
             if "tools" in body:
@@ -912,9 +970,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):
@@ -994,6 +1053,10 @@ class LiteLLMBackend(Backend):
                 kwargs["top_p"] = body["top_p"]
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
+            if "thinking" in body:
+                # See send_message for the full rationale.
+                kwargs["thinking"] = body["thinking"]
+                kwargs["drop_params"] = True
             if "tools" in body:
                 tools_in = body["tools"]
                 # Bedrock Converse API hard-rejects tool names over 64 chars.
@@ -1017,9 +1080,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):
@@ -1068,6 +1132,7 @@ class LiteLLMBackend(Backend):
             # message_delta instead of emitting a second protocol-invalid
             # message_start after content has already streamed.
             final_input_tokens = 0
+            final_output_tokens = 0
             final_cache_read_tokens = 0
             final_cache_write_tokens = 0
 
@@ -1075,6 +1140,7 @@ class LiteLLMBackend(Backend):
                 if hasattr(chunk, "usage") and chunk.usage:
                     cu = chunk.usage
                     final_input_tokens = int(getattr(cu, "prompt_tokens", 0) or 0)
+                    final_output_tokens = int(getattr(cu, "completion_tokens", 0) or 0)
                     final_cache_read_tokens = int(getattr(cu, "cache_read_input_tokens", 0) or 0)
                     final_cache_write_tokens = int(
                         getattr(cu, "cache_creation_input_tokens", 0) or 0
@@ -1185,7 +1251,9 @@ class LiteLLMBackend(Backend):
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
 
-            delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
+            delta_usage: dict[str, Any] = {
+                "output_tokens": final_output_tokens if final_output_tokens > 0 else output_tokens,
+            }
             if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
                 delta_usage["input_tokens"] = final_input_tokens
                 if final_cache_read_tokens:
@@ -1270,9 +1338,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):
@@ -1442,9 +1511,10 @@ class LiteLLMBackend(Backend):
                 kwargs["aws_profile_name"] = self.profile_name
 
             # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            # Skip for Bedrock/Vertex/OpenRouter: they use env-based auth (AWS SigV4 /
+            # Google ADC / OPENROUTER_API_KEY). Forwarding the client's Anthropic
+            # credential (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker", "openrouter")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
                 if auth_header.startswith("Bearer "):

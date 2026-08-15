@@ -200,6 +200,164 @@ class TestLiteLLMToolsForwarding:
             assert isinstance(tool_block["input"], dict)
 
 
+class TestExtendedThinkingForwarding:
+    """Claude Code's `thinking` param must reach litellm.acompletion() unchanged.
+
+    Dropping it silently turns a thinking-budgeted request (temperature=1,
+    max_tokens sized to cover budget_tokens + the answer) into a plain
+    completion request, which can make the model burn its whole max_tokens
+    on invisible reasoning and return almost nothing visible.
+    """
+
+    @staticmethod
+    def _mock_response():
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="Hello", tool_calls=None), finish_reason="stop")
+        ]
+        mock_response.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+        return mock_response
+
+    @pytest.mark.asyncio
+    async def test_thinking_forwarded_in_send_message(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._mock_response()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            body = {
+                "model": "claude-sonnet-4-5-20250929",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 21000,
+                "temperature": 1,
+                "thinking": {"type": "enabled", "budget_tokens": 20000},
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert call_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+            # drop_params lets litellm silently drop `thinking` for targets that
+            # don't support it (e.g. non-reasoning OpenRouter fallback models)
+            # instead of raising UnsupportedParamsError (#issue: deepseek 500).
+            assert call_kwargs["drop_params"] is True
+
+    @pytest.mark.asyncio
+    async def test_thinking_forwarded_in_stream_message(self):
+        async def _empty_stream():
+            return
+            yield  # pragma: no cover
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = _empty_stream()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            body = {
+                "model": "claude-sonnet-4-5-20250929",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 21000,
+                "temperature": 1,
+                "thinking": {"type": "enabled", "budget_tokens": 20000},
+            }
+
+            events = [e async for e in backend.stream_message(body, {})]
+            assert events  # message_start etc. still emitted
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert call_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+            assert call_kwargs["drop_params"] is True
+
+    @pytest.mark.asyncio
+    async def test_thinking_omitted_when_absent(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._mock_response()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            body = {
+                "model": "claude-sonnet-4-5-20250929",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert "thinking" not in call_kwargs
+            # drop_params must stay scoped to requests that actually forward
+            # `thinking`, not a blanket flag on every call.
+            assert "drop_params" not in call_kwargs
+
+    def test_thinking_dropped_for_non_reasoning_openrouter_model(self):
+        """Regression test for the deepseek 500 (#issue).
+
+        litellm.get_optional_params() is the pure, no-network validation step
+        acompletion() runs internally before making the API call. Non-reasoning
+        OpenRouter targets don't list `thinking` as a supported param, so
+        without `drop_params=True` this raises UnsupportedParamsError — exactly
+        the reported "openrouter does not support parameters: ['thinking']" 500.
+        """
+        import litellm
+
+        # Without drop_params, the bug reproduces.
+        with pytest.raises(litellm.UnsupportedParamsError):
+            litellm.get_optional_params(
+                model="deepseek/deepseek-v4-flash-latest",
+                custom_llm_provider="openrouter",
+                thinking={"type": "enabled", "budget_tokens": 20000},
+            )
+
+        # With drop_params=True (the fix), it's dropped instead of raised.
+        params = litellm.get_optional_params(
+            model="deepseek/deepseek-v4-flash-latest",
+            custom_llm_provider="openrouter",
+            thinking={"type": "enabled", "budget_tokens": 20000},
+            drop_params=True,
+        )
+        assert "thinking" not in params
+
+    def test_thinking_preserved_for_reasoning_capable_openrouter_model(self):
+        """Reasoning-capable OpenRouter models must still get `thinking`."""
+        import litellm
+
+        params = litellm.get_optional_params(
+            model="anthropic/claude-sonnet-4-5",
+            custom_llm_provider="openrouter",
+            thinking={"type": "enabled", "budget_tokens": 20000},
+            drop_params=True,
+        )
+        assert params["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+
+    def test_thinking_blocks_preserved_in_history(self):
+        """Assistant thinking blocks must round-trip (signature included).
+
+        Anthropic rejects the next turn without them, and OpenRouter/litellm
+        needs them under `thinking_blocks` to continue extended-thinking
+        conversations correctly.
+        """
+        backend = LiteLLMBackend.__new__(LiteLLMBackend)  # skip __init__ (no litellm calls)
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "reasoning...", "signature": "sig123"},
+                    {"type": "text", "text": "Here is the answer"},
+                ],
+            }
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+        assert converted[0]["thinking_blocks"] == [
+            {"type": "thinking", "thinking": "reasoning...", "signature": "sig123"}
+        ]
+        assert converted[0]["content"] == "Here is the answer"
+
+
 # =============================================================================
 # Message Conversion: tool_use / tool_result (GitHub Issue — Bug 2)
 # =============================================================================
@@ -820,6 +978,48 @@ class TestBedrockApiKeyNotForwarded:
                 kwargs["api_key"] = headers["x-api-key"]
 
         assert "api_key" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_openrouter_does_not_forward_client_anthropic_key(self):
+        """OpenRouter uses env-based auth (OPENROUTER_API_KEY).
+
+        The session-limit fallback forwards the client's original request
+        headers (its Anthropic ``x-api-key``/``Authorization``) straight
+        through to ``send_message``. Those must never be sent to OpenRouter
+        as ``api_key`` — doing so overrides ``OPENROUTER_API_KEY`` with a
+        credential OpenRouter can't authenticate, causing 401s.
+        """
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(content="Hello", tool_calls=None),
+                finish_reason="stop",
+            )
+        ]
+        mock_response.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = mock_response
+
+            backend = LiteLLMBackend(provider="openrouter")
+            headers = {
+                "x-api-key": "sk-ant-dummy-key",
+                "authorization": "Bearer sk-ant-oat-dummy-token",
+            }
+
+            await backend.send_message(
+                {"model": "claude-3-5-sonnet-20241022", "messages": [{"role": "user", "content": "hi"}]},
+                headers,
+            )
+
+            call_kwargs = mock_acomp.call_args[1]
+            assert "api_key" not in call_kwargs, (
+                f"OpenRouter should not have api_key forwarded from client headers, "
+                f"got: {call_kwargs.get('api_key')}"
+            )
 
 
 # =============================================================================

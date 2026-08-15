@@ -396,6 +396,209 @@ Track spending and enforce budgets:
 - Budget periods: hourly, daily, monthly
 - Automatic request rejection when over budget
 
+### Running This Branch Locally
+
+To try a feature branch (e.g. `rpidanny/switch-to-openrouter-when-claude-limit-reached`) straight
+from source instead of a published release:
+
+#### 1. Set env vars
+
+Add these to your shell profile (e.g. `~/.zshrc`) so they persist across terminal sessions instead
+of only the current one, then reload with `source ~/.zshrc` or a new terminal tab:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export HEADROOM_SESSION_LIMIT_FALLBACK=1                 # enables the fallback
+export HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD=0.95     # 95% of the session limit (5hr or 7 day)
+export HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL="deepseek/deepseek-v4-flash-latest"
+export HEADROOM_SUBSCRIPTION_POLL_INTERVAL=60             # default is 300, which is kinda slow
+```
+
+- Get an `OPENROUTER_API_KEY` from [openrouter.ai/keys](https://openrouter.ai/keys).
+- `HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD=0.95` means fallback kicks in once your 5-hour or
+  7-day usage window hits 95%.
+- `HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL` is the OpenRouter model everything falls back
+  to. Double-check the slug against OpenRouter's model list — it must be a plain `provider/model`
+  slug (e.g. `deepseek/deepseek-v4-flash-latest`), no leading `~` or other decoration.
+- `HEADROOM_SUBSCRIPTION_POLL_INTERVAL=60` polls Anthropic usage every 60s instead of the 300s
+  default, so you see the fallback trigger faster while testing (default is fine for normal use —
+  lower values risk 429s from Anthropic).
+
+#### 2. Clone & install
+
+```bash
+git clone git@github.com:rpidanny/headroom.git
+cd headroom
+git checkout rpidanny/switch-to-openrouter-when-claude-limit-reached
+
+python -m venv .venv && source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -e ".[dev,proxy]"
+```
+
+- This mirrors the editable-install steps in [`CONTRIBUTING.md`'s "Development setup"](../CONTRIBUTING.md#development-setup);
+  see there for Node/pre-commit setup if you plan to contribute back.
+- `[dev,proxy]` is enough to run the proxy and the OpenRouter fallback path below. Skip heavier
+  extras (`[ml]`, `[relevance]`, etc.) unless you're also testing ML-based compression.
+
+#### 3. Run it
+
+```bash
+.venv/bin/headroom proxy --port 8787
+```
+
+Run `headroom proxy --help` for the full flag list.
+
+#### 4. Point Claude Code at the proxy
+
+Add the proxy URL to `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8787",
+    "ENABLE_TOOL_SEARCH": "true"
+  }
+}
+```
+
+#### 5. Configure Anthropic → OpenRouter model mappings (optional)
+
+If you want to override the default model for specific Anthropic models:
+
+- Go to `http://127.0.0.1:8787/dashboard/settings`.
+- Under **Advanced**, scroll down to **OpenRouter Fallback**.
+- Add per-model mappings as needed.
+
+#### 6. Use Claude Code (or Conductor) as normal
+
+As soon as your session usage crosses the threshold you set, requests automatically route through
+OpenRouter instead of paying Anthropic's on-demand overage pricing.
+
+### Session-Limit Fallback (OpenRouter)
+
+When using Claude Code with a subscription, Anthropic charges **on-demand pricing** after your
+session limit (5-hour or 7-day window) is exhausted. This feature automatically routes requests
+through OpenRouter once your limit approaches, avoiding the surcharge.
+
+**Prerequisites:**
+- An [OpenRouter API key](https://openrouter.ai/keys)
+- Headroom's subscription tracker enabled (default for OAuth accounts)
+
+#### Quick Start
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export HEADROOM_SESSION_LIMIT_FALLBACK=1
+headroom proxy
+```
+
+> **Dashboard:** All of these knobs (including the OpenRouter API key and model mapping) are also editable from the **OpenRouter Fallback** group in the dashboard Settings GUI at `/dashboard/settings`. The model-mapping field renders as an editable key/value table with autocomplete suggestions for known Claude model IDs. Use **Apply & Restart** to activate changes.
+
+#### How It Works
+
+1. Headroom polls Anthropic's OAuth usage API every 5 minutes to track your 5-hour and 7-day
+   window utilization.
+2. When either window reaches the configured threshold (default 95%), the proxy switches
+   outgoing requests to OpenRouter.
+3. The Claude model ID is translated to OpenRouter's naming convention and routed through
+   a LiteLLM backend.
+
+Only the **direct Anthropic path** is affected. If you're already using `--backend bedrock`,
+`--backend openrouter`, or route-advice extensions, fallback is a no-op.
+
+#### Model Mapping
+
+By default, unmapped models are prefixed as `anthropic/<model>` (OpenRouter's Anthropic
+convention). You can customize this at three levels:
+
+| Level | Config | Example |
+|-------|--------|---------|
+| **Per-model** | `session_limit_fallback_model_map` | `{"claude-sonnet-4-5-20250929": "deepseek/deepseek-chat-v4"}` |
+| **Blanket default** | `session_limit_fallback_default_model` | `"openai/gpt-4o"` |
+| **Auto-prefix** | *(unset)* | `anthropic/claude-sonnet-4-5-20250929` |
+
+Precedence: per-model mapping → blanket default → auto-prefix.
+
+```bash
+# Route Sonnet to DeepSeek, everything else to GPT-4o
+headroom proxy \
+  --session-limit-fallback \
+  --session-limit-fallback-default-model openai/gpt-4o \
+  --session-limit-fallback-model-map \
+    '{"claude-sonnet-4-5-20250929":"deepseek/deepseek-chat-v4"}'
+```
+
+#### Configuration Reference
+
+##### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--session-limit-fallback` | off | Enable automatic OpenRouter fallback when session limit is near |
+| `--session-limit-fallback-threshold` | `0.95` | Utilization threshold (0.0–1.0). Fallback activates when either the 5-hour or 7-day window reaches this percentage |
+| `--session-limit-fallback-default-model` | unset | OpenRouter model for ALL unmatched Anthropic models (e.g. `deepseek/deepseek-chat-v4`, `openai/gpt-4o`) |
+| `--session-limit-fallback-model-map` | unset | JSON object mapping specific Anthropic model IDs to OpenRouter equivalents |
+| `--openrouter-api-key` | unset | OpenRouter API key (also settable via `OPENROUTER_API_KEY` env var) |
+
+##### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEADROOM_SESSION_LIMIT_FALLBACK` | `0` | Set to `1` to enable fallback |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD` | `0.95` | Utilization threshold (0.0–1.0) |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL` | unset | Default OpenRouter model for unmatched Anthropic models |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP` | unset | JSON object: `{"claude-model-id": "openrouter-model-id"}` |
+| `OPENROUTER_API_KEY` | unset | OpenRouter API key |
+
+Each of these in detail:
+
+- **`ANTHROPIC_API_KEY`** — not part of this feature directly, but needed to have something to
+  fall *back from*. If you're testing with Claude Code's own OAuth login rather than a raw API
+  key, you don't need to set this: the subscription tracker reads the OAuth Bearer token straight
+  off requests that pass through the proxy. This only works for **OAuth accounts** — raw API-key
+  traffic has no subscription session-limit concept, so there's nothing to track and fallback
+  never triggers for it.
+- **`OPENROUTER_API_KEY`** — required to fall *to*. Create one at
+  [openrouter.ai/keys](https://openrouter.ai/keys). It's billed by OpenRouter directly and is
+  entirely separate from your Anthropic subscription.
+- **`HEADROOM_SESSION_LIMIT_FALLBACK`** — the master on/off switch (`1` enables, `0`/unset
+  disables). None of the other variables below do anything unless this is set to `1`.
+- **`HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD`** — how close to the limit before switching over.
+  Headroom tracks both the 5-hour and 7-day Anthropic usage windows; fallback triggers as soon as
+  **either** window crosses this fraction (default `0.95` = 95% used).
+- **`HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL`** and
+  **`HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP`** — control which OpenRouter model a given
+  Anthropic model falls back to, per the precedence in [Model Mapping](#model-mapping) above:
+  - Neither set → every model auto-prefixes to `anthropic/<model>` on OpenRouter.
+  - Only `DEFAULT_MODEL` set (e.g. `openai/gpt-4o`) → all unmatched Anthropic models route there.
+  - `MODEL_MAP` set for a specific model (e.g. `{"claude-sonnet-4-5-20250929":"deepseek/deepseek-chat-v4"}`)
+    → that model uses its mapped target regardless of `DEFAULT_MODEL`; anything not in the map
+    still falls through to `DEFAULT_MODEL` (or the auto-prefix if that's also unset).
+
+##### ProxyConfig Fields
+
+When constructing `ProxyConfig` programmatically:
+
+| Field | Type | Default |
+|-------|------|---------|
+| `session_limit_fallback_enabled` | `bool` | `False` |
+| `session_limit_fallback_threshold` | `float` | `0.95` |
+| `session_limit_fallback_default_model` | `str \| None` | `None` |
+| `session_limit_fallback_model_map` | `dict[str, str] \| None` | `None` |
+
+#### Safety Properties
+
+- **No snapshot → no fallback.** If the subscription tracker hasn't polled yet, requests continue
+  through direct Anthropic. No false positives.
+- **Extensions always win.** If a route-advice extension sets a backend, it's never overridden.
+- **Static backends untouched.** If `--backend bedrock` or `--backend openrouter` is already set,
+  fallback is a no-op.
+- **Fail-open.** If the OpenRouter backend fails to build (missing credentials, import error),
+  requests fall back to direct Anthropic rather than blocking traffic.
+- **Logging.** Every fallback activation logs the model mapping at INFO level:
+  `[req-id] Session-limit fallback: routing claude-sonnet-4-5 -> deepseek/deepseek-chat-v4 via OpenRouter`
+
 ### Prometheus Metrics
 
 Export metrics for monitoring:

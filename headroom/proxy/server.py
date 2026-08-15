@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -166,6 +167,7 @@ from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
+from headroom.proxy.session_limit_router import SessionLimitRouter
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.warmup import WarmupRegistry
@@ -1870,6 +1872,31 @@ class HeadroomProxy(
         else:
             logger.info("Subscription tracking: DISABLED")
 
+        # Session-limit-based OpenRouter fallback
+        self.session_limit_router = SessionLimitRouter(
+            config=self.config,
+            subscription_tracker=get_subscription_tracker(),
+            default_backend=self.anthropic_backend,
+        )
+        registry.register(self.session_limit_router)
+        if self.config.session_limit_fallback_enabled:
+            logger.info(
+                "Session-limit fallback: ENABLED "
+                f"(threshold={self.config.session_limit_fallback_threshold:.0%})"
+            )
+            if self.config.session_limit_fallback_default_model:
+                logger.info(
+                    "Session-limit fallback default model: %s",
+                    self.config.session_limit_fallback_default_model,
+                )
+            if self.config.session_limit_fallback_model_map:
+                logger.info(
+                    "Session-limit fallback model map: %s",
+                    json.dumps(self.config.session_limit_fallback_model_map),
+                )
+        else:
+            logger.info("Session-limit fallback: DISABLED")
+
         copilot_tracker = get_copilot_quota_tracker()
         if copilot_tracker.is_available():
             logger.info("GitHub Copilot quota tracking: ENABLED")
@@ -1928,6 +1955,10 @@ class HeadroomProxy(
 
         # Stop all quota trackers via the registry
         await get_quota_registry().stop_all()
+
+        # Clean up session-limit fallback router
+        if hasattr(self, "session_limit_router") and self.session_limit_router is not None:
+            await self.session_limit_router.stop()
 
         # Persist any savings the tracker's write throttle is still holding, so
         # a graceful shutdown doesn't drop the last few requests' totals.
@@ -3453,6 +3484,41 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def settings_schema(_request: Request):
         """Registry + grouped fields + effective values for the settings form."""
         schema = settings_store.to_schema()
+        # Known Anthropic model IDs for the model-map autocomplete in the UI.
+        # Read-only suggestion list; the input stays free-text for custom IDs.
+        try:
+            from headroom.providers.anthropic import ANTHROPIC_CONTEXT_LIMITS
+
+            schema["anthropic_models"] = sorted(ANTHROPIC_CONTEXT_LIMITS.keys())
+            # Family slugs (sonnet-5, opus-4-8, fable-5, …) derived from the
+            # known IDs, presented first in the UI as the preferred mapping key:
+            # one family entry maps every version in that family.
+            from headroom.proxy.session_limit_router import (
+                _anthropic_model_family,
+                _family_lookup_key,
+            )
+
+            families = {
+                f
+                for f in (
+                    _anthropic_model_family(m) for m in ANTHROPIC_CONTEXT_LIMITS
+                )
+                if f
+            }
+            # Current-gen family keys the router honors (bare slugs such as
+            # sonnet-5 and undated claude- pins such as claude-sonnet-5).
+            # Drop EOL families (claude-2.x, claude-3-*: "3-5-sonnet", "2.1",
+            # "instant-1.2") from the UI suggestion list — the router matches
+            # them fine, but the chips should emphasize what operators
+            # actually map today.
+            suggested_keys = {f for f in families if _family_lookup_key(f) is not None}
+            current_gen = {
+                f for f in suggested_keys if re.match(r"^(fable|opus|sonnet|haiku)-\d", f)
+            }
+            schema["anthropic_model_families"] = sorted(current_gen)
+        except Exception:  # noqa: BLE001 — schema must render even if import fails
+            schema["anthropic_models"] = []
+            schema["anthropic_model_families"] = []
         # Tell the UI whether this is a supervised (docker/service) install, where
         # manifest-baked knobs (HEADROOM_PORT/HEADROOM_HOST) are owned by the
         # install manifest and must be rendered read-only. Foreground proxies
@@ -4998,6 +5064,18 @@ def _proxy_config_from_env() -> ProxyConfig:
             os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
             os.environ.get("HEADROOM_MODEL_ROUTES"),
         ),
+        session_limit_fallback_enabled=_get_env_bool(
+            "HEADROOM_SESSION_LIMIT_FALLBACK", False
+        ),
+        session_limit_fallback_threshold=_get_env_float(
+            "HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD", 0.95
+        ),
+        session_limit_fallback_model_map=_parse_session_limit_model_map(
+            os.environ.get("HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP")
+        ),
+        session_limit_fallback_default_model=os.environ.get(
+            "HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL"
+        ) or None,
     )
 
 
@@ -5022,6 +5100,17 @@ def _get_code_aware_banner_status(config: ProxyConfig) -> str:
         if is_tree_sitter_available():
             return "DISABLED (--code-aware or HEADROOM_CODE_AWARE_ENABLED=1 to enable)"
         return "DISABLED  (install headroom-ai[code] to enable)"
+
+
+def _session_limit_banner_status(config: ProxyConfig) -> str:
+    """Get session-limit fallback status line for the startup banner."""
+    if not config.session_limit_fallback_enabled:
+        return "DISABLED"
+    parts = [f"ENABLED  (threshold={config.session_limit_fallback_threshold:.0%}"]
+    if config.session_limit_fallback_default_model:
+        parts.append(f" -> {config.session_limit_fallback_default_model}")
+    parts.append(")")
+    return "".join(parts)
 
 
 def _configure_windows_uvicorn_loop(uvicorn_kwargs: dict[str, Any]) -> None:
@@ -5117,6 +5206,7 @@ def run_server(
 ║    Retry:           {"ENABLED " if config.retry_enabled else "DISABLED"}   (max {config.retry_max_attempts} attempts)                       ║
 ║    Cost Tracking:   {"ENABLED " if config.cost_tracking_enabled else "DISABLED"}   (budget: {"$" + str(config.budget_limit_usd) + "/" + config.budget_period if config.budget_limit_usd else "unlimited"})          ║
 ║    Code-Aware:      {code_aware_status:<52}║
+║    Session-Limit:   {_session_limit_banner_status(config):<52}║
 ║    HTTP/2:          {http2_status:<52}║
 ║    Conn Pool:       {pool_info:<52}║
 ╠══════════════════════════════════════════════════════════════════════╣
@@ -5297,6 +5387,22 @@ def _parse_csv_tools(raw: str | None) -> set[str]:
     return names
 
 
+def _parse_session_limit_model_map(raw: str | None) -> dict[str, str] | None:
+    """Parse a JSON model-map string from env or CLI into a dict.
+
+    Returns None when the input is empty so ProxyConfig keeps its default.
+    """
+    if not raw or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()):
+            return parsed  # type: ignore[return-value]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
 def _parse_tool_profiles(cli_profiles: list[str]) -> dict[str, Any]:
     """Parse tool profiles from CLI args and HEADROOM_TOOL_PROFILES env var.
 
@@ -5392,6 +5498,45 @@ if __name__ == "__main__":
     parser.add_argument(
         "--openrouter-api-key",
         help="OpenRouter API key (or set OPENROUTER_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--session-limit-fallback",
+        action="store_true",
+        help=(
+            "Automatically route to OpenRouter when the Anthropic subscription "
+            "session limit is near (5h or 7d window >= threshold). "
+            "Requires OPENROUTER_API_KEY. Env: HEADROOM_SESSION_LIMIT_FALLBACK=1."
+        ),
+    )
+    parser.add_argument(
+        "--session-limit-fallback-threshold",
+        type=float,
+        default=0.95,
+        help=(
+            "Utilization threshold (0.0-1.0) at which session-limit fallback activates. "
+            "Default 0.95 = fallback at 95%% window utilization. "
+            "Env: HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD."
+        ),
+    )
+    parser.add_argument(
+        "--session-limit-fallback-model-map",
+        help=(
+            'JSON object mapping Anthropic model IDs to OpenRouter equivalents. '
+            'Example: \'{"claude-sonnet-4-5-20250929":"deepseek/deepseek-chat-v4"}\'. '
+            "Unmapped models use --session-limit-fallback-default-model if set, "
+            "otherwise auto-prefix with 'anthropic/'. "
+            "Env: HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP."
+        ),
+    )
+    parser.add_argument(
+        "--session-limit-fallback-default-model",
+        help=(
+            "Default OpenRouter model for ALL Anthropic models not in the "
+            "explicit model map. E.g. 'deepseek/deepseek-chat-v4' or "
+            "'openai/gpt-4o'. When set, every unmatched Claude model routes "
+            "here instead of anthropic/<model>. "
+            "Env: HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL."
+        ),
     )
     parser.add_argument(
         "--anyllm-provider",
@@ -5746,6 +5891,19 @@ if __name__ == "__main__":
             else None
         ),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
+        session_limit_fallback_enabled=args.session_limit_fallback
+        or _get_env_bool("HEADROOM_SESSION_LIMIT_FALLBACK", False),
+        session_limit_fallback_threshold=_get_env_float(
+            "HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD",
+            args.session_limit_fallback_threshold,
+        ),
+        session_limit_fallback_model_map=_parse_session_limit_model_map(
+            args.session_limit_fallback_model_map
+            or os.environ.get("HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP")
+        ),
+        session_limit_fallback_default_model=args.session_limit_fallback_default_model
+        or os.environ.get("HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL")
+        or None,
     )
 
     # Get worker and concurrency settings

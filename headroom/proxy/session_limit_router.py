@@ -1,0 +1,449 @@
+"""Session-aware OpenRouter fallback when Anthropic subscription limits are approached.
+
+Monitors the subscription tracker's 5-hour and 7-day window utilization.
+When either crosses the configured threshold, subsequent requests are routed
+through OpenRouter instead of direct Anthropic to avoid on-demand surcharges.
+
+Activation (all required):
+  1. ``ProxyConfig.session_limit_fallback_enabled`` must be True
+  2. At least one rate-limit window must be at or above the threshold
+  3. The subscription tracker must have a valid snapshot
+
+Integration is via ``SessionLimitRouter.get_backend()`` — call it as close to
+upstream dispatch as possible after the existing ``RouteAdvice`` check so it
+only overrides the direct-Anthropic path and never interferes with an
+extension-driven routing decision.
+
+Usage:
+    router = SessionLimitRouter(
+        config=proxy_config,
+        subscription_tracker=sub_tracker,
+        default_backend=None,
+    )
+
+    backend = router.get_backend(model, request_backend)
+    if backend is not None:
+        # Route through OpenRouter (or another backend)
+    else:
+        # Direct Anthropic API
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import threading
+from datetime import datetime, timezone
+from typing import Any
+
+from headroom.subscription.base import QuotaTracker
+
+logger = logging.getLogger(__name__)
+
+
+_DEFAULT_THRESHOLD = 0.95
+_DEFAULT_MODEL_MAP: dict[str, str] = {}
+
+# Suffixes stripped to reduce a full Anthropic model ID to its family slug.
+# Order matters: the [1m] context marker and dated/Bedrock suffixes are all
+# trailing, so stripping them leaves the "<tier>-<version>" family.
+_FAMILY_SUFFIX_RE = re.compile(
+    r"""
+    \[1m\]$          # context-window marker (claude-sonnet-5[1m])
+    | -\d{8}$        # release date (claude-sonnet-4-5-20250929)
+    | -latest$       # convenience alias
+    | -v\d+(?::\d+)$ # Bedrock version suffix (-v1:0)
+    """,
+    re.VERBOSE,
+)
+
+# Current-generation tiers for recognizing bare family-slug map keys
+# (``sonnet-5``). The ``claude-`` form needs no tier list, but a bare slug
+# has nothing to disambiguate it from an arbitrary custom key, so it must
+# match a known tier to be treated as a family mapping.
+_FAMILY_TIER_RE = re.compile(r"^(fable|opus|sonnet|haiku)-")
+
+
+def _normalize_key(key: str) -> str:
+    """Case-fold + trim a model-map key for tolerant matching.
+
+    The stored JSON keeps the operator's original casing for display; only the
+    lookup is normalized so ``Sonnet-5``, `` sonnet-5 `` and ``SONNET-5`` all
+    resolve to the same entry.
+    """
+    return key.strip().casefold()
+
+
+def _family_lookup_key(key: str) -> str | None:
+    """The family lookup key if ``key`` is a family-style mapping key, else None.
+
+    Two shapes are family keys (any version in the family routes there):
+      * bare slugs: ``sonnet-5``, ``opus-4-8``, ``fable-5``
+      * undated ``claude-`` pins: ``claude-sonnet-5``, ``claude-opus-4-8``
+        (no date/``[1m]``/Bedrock suffix) — e.g. the operator's existing
+        ``claude-sonnet-5`` entry keeps working as a family, not just an
+        exact, mapping.
+
+    Dated full IDs (``claude-sonnet-4-5-20250929``) and arbitrary keys are
+    NOT family keys — they stay exact-only (a dated ID is an explicit pin).
+    """
+    n = _normalize_key(key)
+    if n.startswith("claude-"):
+        remainder = n[len("claude-") :]
+        family = _anthropic_model_family(n)
+        if family is not None and family == remainder:
+            return _normalize_key(family)
+        return None
+    if _FAMILY_TIER_RE.match(n):
+        return n
+    return None
+
+
+def _anthropic_model_family(anthropic_model: str) -> str | None:
+    """Reduce an Anthropic model ID to its family slug.
+
+    Strips (rather than pattern-matching a tier list) so future models
+    (``claude-sonnet-6``, ``claude-opus-5-2``) resolve without code changes:
+
+      ``claude-sonnet-5`` / ``claude-sonnet-5[1m]``     -> ``sonnet-5``
+      ``claude-sonnet-4-6`` / ``claude-sonnet-4-5-20250929`` -> ``sonnet-4-6`` / ``sonnet-4-5``
+      ``claude-opus-4-8`` / ``claude-opus-4-5-20251101`` -> ``opus-4-8`` / ``opus-4-5``
+      ``claude-fable-5``                                 -> ``fable-5``
+      ``claude-haiku-4-5-20251001``                     -> ``haiku-4-5``
+
+    Legacy Claude 3 IDs (``claude-3-5-sonnet-…``) normalize to ``3-5-sonnet``;
+    they're EOL and won't appear in an OpenRouter map, so the oddity is harmless.
+    """
+    s = anthropic_model
+    if not s.startswith("claude-"):
+        return None
+    s = s[len("claude-") :]
+    s = _FAMILY_SUFFIX_RE.sub("", s)
+    return s or None
+
+
+class SessionLimitRouter(QuotaTracker):
+    """Routes requests to OpenRouter when the Anthropic session limit is hit.
+
+    This is a per-proxy-instance object that reads the subscription tracker's
+    latest snapshot on every request. When the five-hour or seven-day window
+    utilization reaches the threshold, it lazily builds an OpenRouter
+    LiteLLM backend and maps the model to the OpenRouter naming convention.
+
+    Also implements :class:`~headroom.subscription.base.QuotaTracker` so it
+    can register with the process-global quota registry — this surfaces its
+    live state (active/inactive, threshold, backend health) under the
+    ``session_limit_fallback`` key in ``/stats`` with zero server-side
+    aggregation changes, the same mechanism the Anthropic/Codex/Copilot
+    quota trackers already use.
+
+    Args:
+        config: The proxy configuration object.
+        subscription_tracker: Reference to the global subscription tracker
+            singleton (may be None if tracking is disabled).
+        default_backend: The native ``anthropic_backend`` (or None for
+            direct API). Returned when fallback is not active.
+    """
+
+    key = "session_limit_fallback"
+    label = "OpenRouter Session-Limit Fallback"
+
+    def __init__(
+        self,
+        config: Any,
+        subscription_tracker: Any = None,
+        default_backend: Any = None,
+    ) -> None:
+        self._enabled: bool = getattr(config, "session_limit_fallback_enabled", False)
+        self._threshold: float = getattr(
+            config, "session_limit_fallback_threshold", _DEFAULT_THRESHOLD
+        )
+        self._subscription_tracker = subscription_tracker
+        self._default_backend = default_backend
+
+        self._model_map: dict[str, str] = dict(
+            getattr(config, "session_limit_fallback_model_map", None) or _DEFAULT_MODEL_MAP
+        )
+        # Case/space-tolerant lookup index; preserves the operator's original
+        # casing only as the stored value source — lookups normalize both sides.
+        self._model_map_normalized: dict[str, str] = {
+            _normalize_key(k): v for k, v in self._model_map.items()
+        }
+        # Family-resolution index: family lookup key -> value. Any family-style
+        # key (bare slug ``sonnet-5`` or undated ``claude-sonnet-5``) registers
+        # here so incoming dated/aliased models route to the family target.
+        self._family_map: dict[str, str] = {}
+        for k, v in self._model_map.items():
+            fk = _family_lookup_key(k)
+            if fk is not None and fk not in self._family_map:
+                self._family_map[fk] = v
+        self._default_model: str | None = getattr(
+            config, "session_limit_fallback_default_model", None
+        ) or None
+
+        self._backend: Any = None
+        self._backend_failed: bool = False
+        self._backend_failed_reason: str | None = None
+
+        # Live-state bookkeeping for `get_stats()` (dashboard/settings UI).
+        self._lock = threading.Lock()
+        self._last_triggered_at: datetime | None = None
+        self._fallback_request_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def is_fallback_active(self) -> bool:
+        """Whether the session limit threshold has been exceeded.
+
+        Returns False when tracking is disabled, no snapshot is available,
+        or all windows are below the configured threshold. Updates
+        ``_last_triggered_at`` (a heartbeat, refreshed on every check that
+        finds fallback active — not just the inactive->active transition)
+        for the ``last_triggered_at`` field in `get_stats()`.
+        """
+        if not self._enabled:
+            return False
+
+        tracker = self._subscription_tracker
+        if tracker is None:
+            return False
+
+        snapshot = tracker.latest_snapshot
+        if snapshot is None:
+            logger.debug("SessionLimitRouter: no snapshot available yet, fallback not active")
+            return False
+
+        threshold_pct = self._threshold * 100.0
+        five_hour = snapshot.five_hour.utilization_pct
+        seven_day = snapshot.seven_day.utilization_pct
+
+        active = five_hour >= threshold_pct or seven_day >= threshold_pct
+        if active:
+            with self._lock:
+                self._last_triggered_at = datetime.now(timezone.utc)
+            logger.info(
+                "SessionLimitRouter: fallback ACTIVE "
+                "(5h=%.1f%%, 7d=%.1f%%, threshold=%.0f%%)",
+                five_hour,
+                seven_day,
+                threshold_pct,
+            )
+        else:
+            logger.debug(
+                "SessionLimitRouter: fallback not active "
+                "(5h=%.1f%%, 7d=%.1f%%, threshold=%.0f%%)",
+                five_hour,
+                seven_day,
+                threshold_pct,
+            )
+        return active
+
+    def is_available(self) -> bool:
+        """Always register with the quota registry.
+
+        Unlike other trackers where ``is_available() == False`` means "omit
+        this key entirely," ``enabled: False`` in :meth:`get_stats` is
+        itself meaningful UI state (the dashboard needs to render a
+        "disabled" indicator, not silently show nothing).
+        """
+        return True
+
+    def get_stats(self) -> dict[str, Any] | None:
+        """Live fallback state for the ``session_limit_fallback`` stats key.
+
+        Reports two independent status axes:
+
+        * ``activation_status`` — whether fallback can ever trigger, driven
+          by the subscription tracker (disabled / tracking not enabled /
+          awaiting first poll / ready).
+        * ``backend_status`` — whether the OpenRouter backend can actually
+          be built, driven by credentials/construction (unconfigured /
+          failed / ok). Independent of ``activation_status`` because a
+          missing API key and disabled subscription tracking are different
+          problems with different fixes.
+        """
+        if not self._enabled:
+            return {
+                "enabled": False,
+                "active": False,
+                "activation_status": "disabled",
+                "backend_status": "ok",
+            }
+
+        tracker = self._subscription_tracker
+        tracking_available = tracker is not None and tracker.is_available()
+        snapshot = tracker.latest_snapshot if tracking_available and tracker else None
+
+        if not tracking_available:
+            activation_status = "tracking_disabled"
+        elif snapshot is None:
+            activation_status = "awaiting_data"
+        else:
+            activation_status = "ready"
+
+        five_hour_pct = snapshot.five_hour.utilization_pct if snapshot else None
+        seven_day_pct = snapshot.seven_day.utilization_pct if snapshot else None
+        utilization_pct = max(
+            (p for p in (five_hour_pct, seven_day_pct) if p is not None), default=None
+        )
+
+        if self._backend is not None:
+            backend_status = "ok"
+        elif self._backend_failed_reason == "unconfigured":
+            backend_status = "unconfigured"
+        elif self._backend_failed_reason == "error":
+            backend_status = "failed"
+        else:
+            backend_status = "ok"  # not yet attempted
+
+        # Evaluate BEFORE reading `_last_triggered_at` — this property has a
+        # side effect (refreshes the heartbeat when active), so reading the
+        # timestamp first would report last call's value, not this one's.
+        active = self.is_fallback_active
+        with self._lock:
+            last_triggered = self._last_triggered_at
+            count = self._fallback_request_count
+
+        return {
+            "enabled": True,
+            "active": active,
+            "activation_status": activation_status,
+            "threshold": self._threshold,
+            "five_hour_utilization_pct": five_hour_pct,
+            "seven_day_utilization_pct": seven_day_pct,
+            "current_utilization_pct": utilization_pct,
+            "backend_status": backend_status,
+            "last_triggered_at": last_triggered.isoformat() if last_triggered else None,
+            "fallback_request_count": count,
+        }
+
+    def get_backend(
+        self,
+        model: str,
+        existing_backend: Any = None,
+    ) -> Any | None:
+        """Return the backend to use for this request.
+
+        Args:
+            model: The Anthropic model ID from the request body.
+            existing_backend: The backend chosen by ``RouteAdvice`` (or
+                ``None`` for direct Anthropic). If a route-advice backend
+                is already set, it wins — we only override the direct path.
+
+        Returns:
+            The OpenRouter backend when fallback is active and no other
+            backend is set; ``existing_backend`` otherwise.
+        """
+        if existing_backend is not None:
+            return existing_backend
+
+        if not self.is_fallback_active:
+            return self._default_backend
+
+        backend = self._get_or_create_openrouter_backend()
+        if backend is None:
+            return self._default_backend
+
+        with self._lock:
+            self._fallback_request_count += 1
+        return backend
+
+    def map_model(self, anthropic_model: str) -> str:
+        """Translate an Anthropic model ID to the OpenRouter format.
+
+        Precedence:
+        1. Exact match on the full incoming model ID in
+           ``session_limit_fallback_model_map`` (escape hatch for pinning one
+           specific version).
+        2. Family match: the model's family slug (e.g. ``sonnet-5`` derived
+           from ``claude-sonnet-5[1m]``) looked up in the map. Any version in
+           that family resolves to one OpenRouter target.
+        3. ``session_limit_fallback_default_model`` (routes ALL unmatched
+           models).
+        4. ``anthropic/<model>`` prefix (OpenRouter's Anthropic convention).
+
+        Keys are matched case- and whitespace-insensitively, so ``Sonnet-5``
+        and `` sonnet-5 `` match.
+
+        Args:
+            anthropic_model: The Anthropic-native model ID (e.g.
+                ``claude-sonnet-4-5-20250929``).
+
+        Returns:
+            The OpenRouter-qualified model ID (e.g.
+            ``deepseek/deepseek-chat-v4`` or
+            ``anthropic/claude-sonnet-4-5-20250929``).
+        """
+        norm = _normalize_key(anthropic_model)
+        # 1. Exact full-ID match (a dated ID, e.g. claude-sonnet-4-5-20250929,
+        # pins that one version).
+        if norm and norm in self._model_map_normalized:
+            return self._model_map_normalized[norm]
+        # 2. Family match: the incoming model's family resolves against any
+        # family-style key in the map (bare slug or undated claude- pin).
+        # Uses the normalized (case-folded) form so oddly-cased incoming
+        # model IDs (e.g. "Claude-Sonnet-5") still resolve to their family,
+        # consistent with the case-insensitive exact-match step above.
+        family = _anthropic_model_family(norm)
+        if family is not None:
+            family_norm = _normalize_key(family)
+            if family_norm in self._family_map:
+                return self._family_map[family_norm]
+        # 3. Catch-all default model.
+        if self._default_model:
+            return self._default_model
+        # 4. Auto-prefix.
+        return f"anthropic/{anthropic_model}"
+
+    async def start(self) -> None:
+        """No-op lifecycle hook. Kept for symmetry with other proxy subsystems."""
+
+    async def stop(self) -> None:
+        """Clean up the lazily-built backend."""
+        backend = self._backend
+        self._backend = None
+        if backend is not None and hasattr(backend, "close"):
+            try:
+                await backend.close()  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _get_or_create_openrouter_backend(self) -> Any | None:
+        if self._backend_failed:
+            return None
+        if self._backend is not None:
+            return self._backend
+
+        # Fail closed (stay on direct Anthropic) when there's no key to
+        # authenticate with, rather than building a backend that will only
+        # discover the missing credential once a real request is dispatched
+        # to OpenRouter — by then the only recourse is a 500 to the client.
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            logger.warning(
+                "SessionLimitRouter: OPENROUTER_API_KEY is not set; "
+                "cannot activate OpenRouter fallback"
+            )
+            self._backend_failed = True
+            self._backend_failed_reason = "unconfigured"
+            return None
+
+        try:
+            from headroom.backends.litellm import LiteLLMBackend
+
+            self._backend = LiteLLMBackend(provider="openrouter")
+            logger.info("SessionLimitRouter: OpenRouter backend built for fallback")
+        except Exception as exc:
+            logger.warning("SessionLimitRouter: failed to build OpenRouter backend (%s)", exc)
+            self._backend_failed = True
+            self._backend_failed_reason = "error"
+            return None
+
+        return self._backend

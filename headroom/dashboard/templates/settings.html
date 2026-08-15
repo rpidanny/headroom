@@ -72,9 +72,43 @@
         <!-- Grouped fields -->
         <template x-if="loaded">
             <form @submit.prevent>
+                <datalist id="anthropic-model-keys">
+                    <template x-for="m in modelKeySuggestions" :key="m">
+                        <option :value="m"></option>
+                    </template>
+                </datalist>
                 <template x-for="group in groups.filter(g => fieldsIn(g).length > 0)" :key="group">
                     <div class="card rounded-lg p-5 mb-4">
                         <h2 class="text-sm font-semibold uppercase tracking-wide field-help mb-4" x-text="group"></h2>
+                        <template x-if="group === 'OpenRouter Fallback' && fallbackStats">
+                            <div class="mb-4 px-3 py-2 rounded border border-border text-xs">
+                                <div class="flex items-center gap-2 mb-1">
+                                    <span class="w-2 h-2 rounded-full"
+                                          :class="fallbackStats.active ? 'bg-amber-400' : 'bg-gray-600'"></span>
+                                    <span class="font-medium"
+                                          x-text="!fallbackStats.enabled ? 'Disabled' : (fallbackStats.active ? 'Currently ACTIVE' : 'Enabled, standing by')"></span>
+                                </div>
+                                <template x-if="fallbackStats.enabled">
+                                    <div class="field-help">
+                                        Utilization: <span x-text="(fallbackStats.current_utilization_pct || 0).toFixed(1) + '%'"></span>
+                                        / threshold <span x-text="(fallbackStats.threshold * 100).toFixed(0) + '%'"></span>
+                                        &middot; Routed requests: <span x-text="fallbackStats.fallback_request_count"></span>
+                                        <template x-if="fallbackStats.last_triggered_at">
+                                            <span> &middot; last triggered <span x-text="formatRelativeTime(fallbackStats.last_triggered_at)"></span></span>
+                                        </template>
+                                    </div>
+                                </template>
+                                <div class="text-red-400 mt-1" x-show="fallbackStats.activation_status === 'tracking_disabled'">
+                                    Subscription tracking is off — fallback can never activate. Enable subscription tracking too.
+                                </div>
+                                <div class="text-red-400 mt-1" x-show="fallbackStats.activation_status !== 'tracking_disabled' && fallbackStats.backend_status === 'unconfigured'">
+                                    Missing OPENROUTER_API_KEY — set it below, then Apply &amp; Restart.
+                                </div>
+                                <div class="text-red-400 mt-1" x-show="fallbackStats.activation_status !== 'tracking_disabled' && fallbackStats.backend_status === 'failed'">
+                                    Backend failed to initialize; restart required after fixing the config.
+                                </div>
+                            </div>
+                        </template>
                         <template x-for="field in fieldsIn(group)" :key="field.key">
                             <div class="mb-4 last:mb-0">
                                 <label class="flex items-center justify-between gap-4">
@@ -110,6 +144,73 @@
                                                :disabled="isLocked(field)"
                                                x-model="values[field.key]"
                                                @input="delete clearedKeys[field.key]">
+                                    </template>
+                                    <!-- model-map: family-first key/value table with Anthropic-model autocomplete -->
+                                    <template x-if="field.type === 'model-map'">
+                                        <div class="w-full mt-1">
+                                            <template x-if="modelRows[field.key]">
+                                                <div class="space-y-3">
+                                                    <!-- Quick-add family chips: one click to start a family mapping -->
+                                                    <div class="flex flex-wrap gap-1.5" x-show="anthropicModelFamilies.length">
+                                                        <template x-for="fam in anthropicModelFamilies" :key="fam">
+                                                            <button type="button"
+                                                                    :disabled="mappedFamilies(field.key).includes(fam)"
+                                                                    @click="addFamilyMapping(field.key, fam)"
+                                                                    :class="mappedFamilies(field.key).includes(fam)
+                                                                        ? 'opacity-40 cursor-not-allowed'
+                                                                        : 'hover:bg-accent/20'"
+                                                                    class="px-2 py-0.5 rounded text-xs card" x-text="fam"></button>
+                                                        </template>
+                                                    </div>
+                                                    <!-- Family mappings -->
+                                                    <div x-show="familyRows(field.key).length">
+                                                        <p class="text-xs font-semibold uppercase tracking-wide field-help mb-1">Family mappings</p>
+                                                        <template x-for="(row, idx) in familyRows(field.key)" :key="'fam-'+idx">
+                                                            <div class="flex items-center gap-2 mb-2">
+                                                                <input type="text" list="anthropic-model-keys"
+                                                                       placeholder="sonnet-5"
+                                                                       class="rounded px-2 py-1 text-sm flex-1"
+                                                                       x-model="row.key"
+                                                                       @input="syncModelMap(field.key)">
+                                                                <span class="text-xs field-help">&rarr;</span>
+                                                                <input type="text" placeholder="openai/gpt-4o"
+                                                                       class="rounded px-2 py-1 text-sm flex-1"
+                                                                       x-model="row.value"
+                                                                       @input="syncModelMap(field.key)">
+                                                                <button type="button"
+                                                                        @click="removeRow(field.key, row)"
+                                                                        class="text-red-500/80 hover:text-red-500 text-sm px-1">&times;</button>
+                                                            </div>
+                                                        </template>
+                                                    </div>
+                                                    <!-- Custom (full-ID / ad-hoc) mappings -->
+                                                    <div x-show="customRows(field.key).length">
+                                                        <p class="text-xs font-semibold uppercase tracking-wide field-help mb-1">Custom mappings</p>
+                                                        <template x-for="(row, idx) in customRows(field.key)" :key="'cus-'+idx">
+                                                            <div class="flex items-center gap-2 mb-2">
+                                                                <input type="text" list="anthropic-model-keys"
+                                                                       placeholder="claude-sonnet-4-5-20250929"
+                                                                       class="rounded px-2 py-1 text-sm flex-1"
+                                                                       x-model="row.key"
+                                                                       @input="syncModelMap(field.key)">
+                                                                <span class="text-xs field-help">&rarr;</span>
+                                                                <input type="text" placeholder="openai/gpt-4o"
+                                                                       class="rounded px-2 py-1 text-sm flex-1"
+                                                                       x-model="row.value"
+                                                                       @input="syncModelMap(field.key)">
+                                                                <button type="button"
+                                                                        @click="removeRow(field.key, row)"
+                                                                        class="text-red-500/80 hover:text-red-500 text-sm px-1">&times;</button>
+                                                            </div>
+                                                        </template>
+                                                    </div>
+                                                    <button type="button"
+                                                            @click="modelRows[field.key].push({key:'', value:''}); syncModelMap(field.key)"
+                                                            class="text-xs text-accent hover:underline">+ Add mapping</button>
+                                                    <p class="text-xs field-help">Use family names like <code>sonnet-5</code>, <code>opus-4-8</code>, <code>fable-5</code> to map every version in that family. Full model IDs also work as an exact override.</p>
+                                                </div>
+                                            </template>
+                                        </div>
                                     </template>
                                 </label>
                                 <template x-if="field.secret && !isLocked(field)">
@@ -172,6 +273,11 @@
                 applyCommand: '',
                 activeTab: 'basic',  // 'basic' (Settings tab) | 'advanced'
                 clearedKeys: {},  // secret fields explicitly cleared this session (send null on save)
+                modelRows: {},    // model-map fields: array of {key, value} pairs for the table UI
+                anthropicModels: [],  // known Claude model IDs for autocomplete (from /settings/schema)
+                anthropicModelFamilies: [],  // known Claude family slugs (sonnet-5, opus-4-8, …)
+                modelKeySuggestions: [],  // families-first + full IDs for the combined datalist
+                fallbackStats: null,  // live session_limit_fallback state from /stats, best-effort
 
                 async init() {
                     try {
@@ -189,13 +295,121 @@
                         // (docker/service); there manifest-managed knobs are baked
                         // into the install manifest and cannot be changed via the GUI.
                         this.manifestManaged = !!schema.supervised;
+                        // Known Claude model IDs for the model-map autocomplete.
+                        this.anthropicModels = schema.anthropic_models || [];
+                        this.anthropicModelFamilies = schema.anthropic_model_families || [];
+                        // Families first (the preferred mapping key), then full IDs.
+                        this.modelKeySuggestions = [
+                            ...this.anthropicModelFamilies,
+                            ...this.anthropicModels,
+                        ];
+                        // Parse model-map JSON strings into editable row arrays.
+                        this.modelRows = {};
+                        for (const f of this.fields) {
+                            if (f.type === 'model-map') {
+                                this.modelRows[f.key] = this.parseModelRows(this.values[f.key]);
+                            }
+                        }
                         this.loaded = true;
                     } catch (e) {
                         this.loadError = 'Failed to load settings: ' + e.message;
                     }
+
+                    // Best-effort live-state readout for the OpenRouter Fallback
+                    // group. Settings must remain usable even if /stats is
+                    // unreachable, so failures here are silently ignored.
+                    try {
+                        const statsRes = await fetch('/stats?cached=1');
+                        if (statsRes.ok) {
+                            const stats = await statsRes.json();
+                            this.fallbackStats = stats.session_limit_fallback || null;
+                        }
+                    } catch (e) { /* non-fatal */ }
                 },
 
                 fieldsIn(group) { return this.fields.filter(f => f.group === group && f.tier === this.activeTab); },
+
+                formatRelativeTime(ts) {
+                    if (!ts) return '-';
+                    const d = new Date(ts);
+                    const diff = (Date.now() - d) / 1000;
+                    if (diff < 60) return Math.floor(diff) + 's ago';
+                    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+                    return d.toLocaleTimeString();
+                },
+
+                parseModelRows(jsonStr) {
+                    if (!jsonStr) return [];
+                    try {
+                        const obj = JSON.parse(jsonStr);
+                        return Object.entries(obj).map(([key, value]) => ({key, value}));
+                    } catch (e) { return []; }
+                },
+
+                syncModelMap(key) {
+                    const obj = {};
+                    for (const row of this.modelRows[key]) {
+                        const k = (row.key || '').trim();
+                        const v = (row.value || '').trim();
+                        if (k && v) obj[k] = v;
+                    }
+                    this.values[key] = Object.keys(obj).length ? JSON.stringify(obj) : '';
+                },
+
+                familySlug(key) {
+                    // Accepts the bare slug (sonnet-5) or the undated claude-
+                    // pin (claude-sonnet-5) — both behave as family keys and
+                    // group under "Family mappings".
+                    const k = (key || '').trim().toLowerCase();
+                    for (const f of this.anthropicModelFamilies) {
+                        const s = f.toLowerCase();
+                        if (k === s || k === 'claude-' + s) return s;
+                    }
+                    return null;
+                },
+
+                isFamilyKey(key) { return this.familySlug(key) !== null; },
+
+                familyRows(fieldKey) {
+                    return (this.modelRows[fieldKey] || []).filter(r => r.key && this.isFamilyKey(r.key));
+                },
+
+                customRows(fieldKey) {
+                    return (this.modelRows[fieldKey] || []).filter(r => !r.key || !this.isFamilyKey(r.key));
+                },
+
+                mappedFamilies(fieldKey) {
+                    const out = [];
+                    for (const r of this.modelRows[fieldKey] || []) {
+                        const s = this.familySlug(r.key);
+                        if (s) out.push(s);
+                    }
+                    return out;
+                },
+
+                addFamilyMapping(fieldKey, family) {
+                    if (this.mappedFamilies(fieldKey).includes(family.toLowerCase())) return;
+                    if (!this.modelRows[fieldKey]) this.modelRows[fieldKey] = [];
+                    this.modelRows[fieldKey].push({ key: family, value: '' });
+                    this.syncModelMap(fieldKey);
+                    this.$nextTick(() => {
+                        const rows = this.modelRows[fieldKey];
+                        const last = rows[rows.length - 1];
+                        if (last) {
+                            const inputs = document.querySelectorAll('input[list="anthropic-model-keys"]');
+                            // Focus the value input paired with the just-added row key.
+                            for (const inp of inputs) {
+                                if (inp.value === family) { inp.focus(); break; }
+                            }
+                        }
+                    });
+                },
+
+                removeRow(fieldKey, row) {
+                    const idx = this.modelRows[fieldKey].indexOf(row);
+                    if (idx > -1) this.modelRows[fieldKey].splice(idx, 1);
+                    this.syncModelMap(fieldKey);
+                },
 
                 isLocked(field) { return (!!field.manifest_managed && this.manifestManaged) || !!field.env_override; },
 

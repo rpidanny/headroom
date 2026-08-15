@@ -228,6 +228,12 @@ Some settings can be configured via environment variables:
 | `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](memory.md#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
 | `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](#session-beta-header-tracking). | `enabled` |
 | `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+| `HEADROOM_SESSION_LIMIT_FALLBACK` | Set to `1` to enable automatic OpenRouter fallback when the Anthropic subscription session limit is near. Requires `OPENROUTER_API_KEY`. | `0` |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_THRESHOLD` | Utilization threshold (0.0–1.0). Fallback activates when either the 5-hour or 7-day window reaches this percentage. | `0.95` |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_DEFAULT_MODEL` | Default OpenRouter model for all unmatched Anthropic models (e.g. `deepseek/deepseek-chat-v4`). | unset |
+| `HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP` | JSON object mapping specific Anthropic model IDs to OpenRouter equivalents. Example: `{"claude-sonnet-4-5-20250929":"deepseek/deepseek-chat-v4"}`. Also editable from the dashboard Settings page with a key/value table UI. | unset |
+
+All `HEADROOM_SESSION_LIMIT_FALLBACK*` knobs and `OPENROUTER_API_KEY` are also editable from the **OpenRouter Fallback** group in the dashboard Settings GUI (`/dashboard/settings`). The model-mapping field renders as an editable key/value table with autocomplete for known Claude model IDs.
 
 ## Settings GUI
 

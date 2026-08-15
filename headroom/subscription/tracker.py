@@ -369,6 +369,15 @@ class SubscriptionTracker(QuotaTracker):
 
     async def _poll_loop(self) -> None:
         assert self._stop_event is not None
+        # Execute first poll immediately to load subscription data before proxy
+        # handles requests. Ensures SessionLimitRouter has latest_snapshot when
+        # early requests arrive. Only polls if a token is available (either from
+        # active request or cached credentials).
+        try:
+            await self._maybe_poll()
+        except Exception as exc:
+            logger.warning("Subscription tracker initial poll error: %s", exc)
+
         while not self._stop_event.is_set():
             try:
                 await self._maybe_poll()
@@ -398,8 +407,6 @@ class SubscriptionTracker(QuotaTracker):
             from headroom.subscription.client import read_cached_oauth_token
 
             bg_token = read_cached_oauth_token()
-            if not bg_token:
-                return
             token = token or bg_token
 
         snapshot = await self._client.fetch(token)

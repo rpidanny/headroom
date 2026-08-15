@@ -26,6 +26,10 @@ def workspace(tmp_path, monkeypatch):
 def _clear_env(monkeypatch):
     for field in settings_store.SETTINGS:
         monkeypatch.delenv(field.env, raising=False)
+    # `_pristine_environ` is a module-level snapshot captured once per process
+    # (real usage: once per proxy run). Reset it so each test's "process" gets
+    # its own fresh pristine baseline from whatever env state it sets up next.
+    monkeypatch.setattr(settings_store, "_pristine_environ", None)
 
 
 class TestRoundTrip:
@@ -145,6 +149,51 @@ class TestEffectiveValues:
         assert settings_store.effective_values()["savings_profile"] == "general"
 
 
+class TestEnvOverrideDetection:
+    """`to_schema()`'s `env_override` must reflect a real external export, not
+    `apply_to_environ()`'s own setdefault mirroring of a stored value into
+    os.environ -- otherwise the dashboard treats every saved field as
+    environment-locked after its first restart and silently drops edits."""
+
+    def test_apply_to_environ_mirroring_is_not_env_override(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"session_limit_fallback_model_map": '{"sonnet-5": "openai/gpt-4o"}'})
+        # Simulates process startup: apply_to_environ mirrors the stored file
+        # value into os.environ so env-driven readers (Click, _get_env_bool)
+        # pick it up -- this must NOT be mistaken for an external override.
+        settings_store.apply_to_environ(settings_store.load())
+        assert os.environ["HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP"]
+
+        schema = settings_store.to_schema()
+        field = next(
+            f for f in schema["fields"] if f["key"] == "session_limit_fallback_model_map"
+        )
+        assert field["env_override"] is False
+
+    def test_real_external_export_is_env_override(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv(
+            "HEADROOM_SESSION_LIMIT_FALLBACK_MODEL_MAP", '{"sonnet-5": "z-ai/glm-5.2"}'
+        )
+        settings_store.apply_to_environ(settings_store.load())
+
+        schema = settings_store.to_schema()
+        field = next(
+            f for f in schema["fields"] if f["key"] == "session_limit_fallback_model_map"
+        )
+        assert field["env_override"] is True
+
+    def test_to_schema_before_any_apply_still_detects_export(self, workspace, monkeypatch):
+        """`to_schema()` may run before `apply_to_environ()` in-process (e.g. a
+        test, or an embedded caller) -- the pristine snapshot must still be
+        captured correctly the first time either function touches it."""
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_PORT", "7777")
+        schema = settings_store.to_schema()
+        field = next(f for f in schema["fields"] if f["key"] == "port")
+        assert field["env_override"] is True
+
+
 class TestSecretMasking:
     def test_schema_and_stored_mask_secret(self, workspace, monkeypatch):
         _clear_env(monkeypatch)
@@ -261,6 +310,114 @@ class TestSecretMasking:
         settings_store.save({"openai_base_url": "https://custom.openai.example.com/v1"})
         stored = settings_store.load()
         assert stored.get("openai_base_url") == "https://custom.openai.example.com/v1"
+
+
+class TestOpenRouterFallback:
+    """Round-trip, validation, and masking tests for the OpenRouter fallback knobs."""
+
+    def test_model_map_round_trip(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save(
+            {"session_limit_fallback_model_map": '{"claude-sonnet-4-5-20250929": "deepseek/deepseek-chat-v4"}'}
+        )
+        stored = settings_store.load()
+        canonical = json.dumps(
+            {"claude-sonnet-4-5-20250929": "deepseek/deepseek-chat-v4"}, sort_keys=True
+        )
+        assert stored.get("session_limit_fallback_model_map") == canonical
+
+    def test_model_map_invalid_json_raises(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        with pytest.raises(settings_store.SettingsValidationError) as exc:
+            settings_store.save({"session_limit_fallback_model_map": "not json"})
+        assert "session_limit_fallback_model_map" in exc.value.field_errors
+
+    def test_model_map_non_string_values_raises(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        with pytest.raises(settings_store.SettingsValidationError) as exc:
+            settings_store.save({"session_limit_fallback_model_map": '{"claude-x": 123}'})
+        assert "session_limit_fallback_model_map" in exc.value.field_errors
+
+    def test_model_map_non_object_raises(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        with pytest.raises(settings_store.SettingsValidationError) as exc:
+            settings_store.save({"session_limit_fallback_model_map": '["a", "b"]'})
+        assert "session_limit_fallback_model_map" in exc.value.field_errors
+
+    def test_model_map_clear_on_none(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"session_limit_fallback_model_map": '{"claude-x": "openai/gpt-4o"}'})
+        assert "session_limit_fallback_model_map" in settings_store.load()
+        settings_store.save({"session_limit_fallback_model_map": None})
+        assert "session_limit_fallback_model_map" not in settings_store.load()
+
+    def test_bool_round_trip(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"session_limit_fallback": True})
+        assert settings_store.load() == {"session_limit_fallback": True}
+
+    def test_threshold_float_round_trip(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"session_limit_fallback_threshold": 0.8})
+        assert settings_store.load() == {"session_limit_fallback_threshold": 0.8}
+
+    def test_threshold_rejects_above_max(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        with pytest.raises(settings_store.SettingsValidationError) as exc:
+            settings_store.save({"session_limit_fallback_threshold": 1.5})
+        assert "session_limit_fallback_threshold" in exc.value.field_errors
+
+    def test_threshold_rejects_below_min(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        with pytest.raises(settings_store.SettingsValidationError) as exc:
+            settings_store.save({"session_limit_fallback_threshold": -0.1})
+        assert "session_limit_fallback_threshold" in exc.value.field_errors
+
+    def test_default_model_str_round_trip(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"session_limit_fallback_default_model": "openai/gpt-4o"})
+        assert settings_store.load() == {"session_limit_fallback_default_model": "openai/gpt-4o"}
+
+    def test_openrouter_api_key_secret_masking(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"openrouter_api_key": "sk-or-test-123"})
+        assert settings_store.stored_values()["openrouter_api_key"] == settings_store._MASK
+        # unmasked read returns real value
+        assert settings_store.stored_values(mask_secrets=False)["openrouter_api_key"] == "sk-or-test-123"
+
+    def test_openrouter_api_key_retain_on_mask(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"openrouter_api_key": "sk-or-test-123"})
+        settings_store.save({"openrouter_api_key": settings_store._MASK})
+        assert settings_store.stored_values(mask_secrets=False)["openrouter_api_key"] == "sk-or-test-123"
+
+    def test_openrouter_api_key_clear_on_none(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        settings_store.save({"openrouter_api_key": "sk-or-test-123"})
+        assert "openrouter_api_key" in settings_store.load()
+        settings_store.save({"openrouter_api_key": None})
+        assert "openrouter_api_key" not in settings_store.load()
+
+    def test_openrouter_api_key_apply_to_environ(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        settings_store.apply_to_environ({"openrouter_api_key": "sk-or-test-123"})
+        assert os.environ["OPENROUTER_API_KEY"] == "sk-or-test-123"
+
+    def test_openrouter_api_key_explicit_export_wins(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-from-shell")
+        settings_store.apply_to_environ({"openrouter_api_key": "sk-or-test-123"})
+        assert os.environ["OPENROUTER_API_KEY"] == "sk-or-from-shell"
+
+    def test_effective_values_defaults(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        eff = settings_store.effective_values()
+        assert eff["session_limit_fallback"] is False
+        assert eff["session_limit_fallback_threshold"] == 0.95
+        assert eff["session_limit_fallback_default_model"] is None
+        assert eff["session_limit_fallback_model_map"] is None
+        assert eff["openrouter_api_key"] is None
 
 
 class TestRegistryDriftAgainstClick:
